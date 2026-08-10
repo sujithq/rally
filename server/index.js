@@ -10,6 +10,17 @@ const dataDirectory = path.join(rootDirectory, 'data')
 const dataFile = path.join(dataDirectory, 'polls.json')
 const distDirectory = path.join(rootDirectory, 'dist')
 const port = Number(process.env.PORT) || 4174
+
+function parseMaxDates(value) {
+  const normalizedValue = value?.trim().toLowerCase()
+  if (!normalizedValue || ['0', 'none', 'unlimited'].includes(normalizedValue)) return null
+  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
+    throw new Error('MAX_POLL_DATES must be a positive integer, 0, none, or unlimited.')
+  }
+  return Number(normalizedValue)
+}
+
+const maxPollDates = parseMaxDates(process.env.MAX_POLL_DATES)
 const app = express()
 
 app.use(express.json({ limit: '64kb' }))
@@ -47,8 +58,8 @@ function validateOptions(options) {
     return 'Choose at least one date.'
   }
 
-  if (options.length > 9) {
-    return 'Free polls can include up to 9 dates.'
+  if (maxPollDates !== null && options.length > maxPollDates) {
+    return `Polls can include up to ${maxPollDates} dates.`
   }
 
   const uniqueDates = new Set()
@@ -67,6 +78,10 @@ function validateOptions(options) {
 
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok' })
+})
+
+app.get('/api/config', (_request, response) => {
+  response.json({ maxDates: maxPollDates })
 })
 
 app.post('/api/polls', async (request, response, next) => {

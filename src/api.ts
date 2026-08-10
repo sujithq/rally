@@ -23,6 +23,10 @@ export function getPoll(pollId: string) {
   return request<Poll>(`/api/polls/${pollId}`)
 }
 
+export function getConfig() {
+  return request<{ maxDates: number | null }>('/api/config')
+}
+
 export function saveResponse(
   pollId: string,
   response: { participantId?: string; name: string; votes: Record<string, Vote> },

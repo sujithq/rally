@@ -6,7 +6,7 @@ const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 interface CalendarPickerProps {
   selectedDates: string[]
-  maxDates: number
+  maxDates: number | null
   onToggle: (date: string) => void
 }
 
@@ -28,7 +28,7 @@ export default function CalendarPicker({ selectedDates, maxDates, onToggle }: Ca
     return new Date(visibleMonth.getFullYear(), visibleMonth.getMonth(), dayNumber)
   })
   const previousDisabled = isSameMonth(visibleMonth, firstAvailableMonth)
-  const atLimit = selectedDates.length >= maxDates
+  const atLimit = maxDates !== null && selectedDates.length >= maxDates
 
   const moveMonth = (offset: number) => {
     setVisibleMonth((current) => new Date(current.getFullYear(), current.getMonth() + offset, 1))

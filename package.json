@@ -4,11 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"node --watch server/index.js\"",
+    "dev": "concurrently \"vite\" \"node --watch --env-file-if-exists=.env server/index.js\"",
     "dev:client": "vite",
-    "dev:server": "node --watch server/index.js",
+    "dev:server": "node --watch --env-file-if-exists=.env server/index.js",
     "build": "tsc -b && vite build",
-    "start": "node server/index.js",
+    "start": "node --env-file-if-exists=.env server/index.js",
     "preview": "vite preview"
   },
   "dependencies": {

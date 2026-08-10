@@ -4,13 +4,12 @@ import { createPoll } from './api'
 import CalendarPicker from './CalendarPicker'
 import { formatDate } from './date'
 
-const maxDates = 9
-
 interface CreatePollProps {
+  maxDates: number | null
   onCreated: (pollId: string) => void
 }
 
-export default function CreatePoll({ onCreated }: CreatePollProps) {
+export default function CreatePoll({ maxDates, onCreated }: CreatePollProps) {
   const [title, setTitle] = useState('')
   const [organizer, setOrganizer] = useState(() => localStorage.getItem('rally-organizer') || '')
   const [description, setDescription] = useState('')
@@ -19,12 +18,13 @@ export default function CreatePoll({ onCreated }: CreatePollProps) {
   const [times, setTimes] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const atLimit = maxDates !== null && selectedDates.length >= maxDates
 
   const toggleDate = (date: string) => {
     setError('')
     setSelectedDates((current) => {
       if (current.includes(date)) return current.filter((item) => item !== date)
-      if (current.length >= maxDates) return current
+      if (maxDates !== null && current.length >= maxDates) return current
       return [...current, date].sort()
     })
   }
@@ -143,11 +143,15 @@ export default function CreatePoll({ onCreated }: CreatePollProps) {
               <span className="step-number">02</span>
               <div>
                 <h2 id="dates-heading">Date options</h2>
-                <p>Choose up to 9 dates, then add times if needed.</p>
+                <p>
+                  {maxDates === null
+                    ? 'Choose as many dates as you need, then add times if needed.'
+                    : `Choose up to ${maxDates} dates, then add times if needed.`}
+                </p>
               </div>
             </div>
-            <span className={`date-count${selectedDates.length === maxDates ? ' full' : ''}`}>
-              {selectedDates.length} / {maxDates}
+            <span className={`date-count${atLimit ? ' full' : ''}`}>
+              {selectedDates.length}{maxDates === null ? ' selected' : ` / ${maxDates}`}
             </span>
           </div>
 
@@ -189,8 +193,8 @@ export default function CreatePoll({ onCreated }: CreatePollProps) {
             )}
           </div>
 
-          {selectedDates.length === maxDates && (
-            <p className="limit-note">You&apos;ve reached the 9-date limit for a free poll.</p>
+          {atLimit && (
+            <p className="limit-note">You&apos;ve reached the {maxDates}-date limit for this poll.</p>
           )}
 
           <div className="create-action">
