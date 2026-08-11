@@ -1423,6 +1423,121 @@ h2 {
   font-size: 13px;
 }
 
+.account-page {
+  width: min(640px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 68px 0 88px;
+}
+
+.account-heading {
+  margin-bottom: 28px;
+  animation: rise-in 420ms ease both;
+}
+
+.account-heading h1,
+.account-summary h1 {
+  margin: 0;
+  font-size: 42px;
+  line-height: 1.05;
+}
+
+.account-panel {
+  border: 1px solid rgba(23, 58, 51, 0.18);
+  border-radius: 8px;
+  padding: 34px;
+  background: var(--white);
+  box-shadow: var(--shadow);
+  animation: rise-in 420ms 80ms ease both;
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 4px;
+  background: var(--cream);
+}
+
+.auth-tabs button {
+  min-height: 42px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--ink-soft);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.auth-tabs button.active {
+  color: var(--ink);
+  background: var(--white);
+  box-shadow: 0 2px 9px rgba(31, 55, 48, 0.1);
+}
+
+.account-form {
+  margin-top: 28px;
+}
+
+.account-form .button {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.account-skip {
+  display: block;
+  margin: 22px auto 0;
+  border: 0;
+  padding: 4px;
+  color: var(--ink-soft);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.account-skip:hover {
+  color: var(--ink);
+}
+
+.account-summary {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 20px;
+}
+
+.account-summary .eyebrow {
+  margin-bottom: 7px;
+}
+
+.account-summary p {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+}
+
+.account-icon {
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--ink);
+  border-radius: 7px;
+  color: var(--white);
+  background: var(--teal);
+  box-shadow: 4px 4px 0 var(--yellow);
+}
+
+.account-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 .status-page {
   width: min(560px, calc(100% - 40px));
   min-height: calc(100vh - 73px);
@@ -1494,7 +1609,8 @@ h2 {
   .create-page,
   .poll-page,
   .manage-index-page,
-  .manage-poll-page {
+  .manage-poll-page,
+  .account-page {
     width: min(100% - 28px, 1180px);
   }
 
@@ -1527,7 +1643,8 @@ h2 {
   .create-page,
   .poll-page,
   .manage-index-page,
-  .manage-poll-page {
+  .manage-poll-page,
+  .account-page {
     padding-top: 38px;
     padding-bottom: 60px;
   }
@@ -1567,8 +1684,33 @@ h2 {
   }
 
   .manage-titlebar h1,
-  .manage-hero h1 {
+  .manage-hero h1,
+  .account-heading h1,
+  .account-summary h1 {
     font-size: 38px;
+  }
+
+  .account-panel {
+    padding: 26px 20px;
+  }
+
+  .account-summary {
+    grid-template-columns: 50px minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .account-icon {
+    width: 50px;
+    height: 50px;
+  }
+
+  .account-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .account-actions .button {
+    width: 100%;
   }
 
   .manage-titlebar .button,

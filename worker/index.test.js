@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import worker, { PollCoordinator } from './index.js'
+import worker, { AccountCoordinator, PollCoordinator } from './index.js'
 
 class MemoryDurableStorage {
   values = new Map()
+  alarmAt = null
 
   async get(key) {
     return this.values.get(key)
@@ -23,10 +24,15 @@ class MemoryDurableStorage {
     return this.values.delete(key)
   }
 
-  async list({ prefix }) {
+  async list({ prefix = '', startAfter = '', limit = Number.POSITIVE_INFINITY } = {}) {
     return new Map([...this.values]
-      .filter(([key]) => key.startsWith(prefix))
-      .sort(([left], [right]) => left.localeCompare(right)))
+      .filter(([key]) => key.startsWith(prefix) && (!startAfter || key > startAfter))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(0, limit))
+  }
+
+  async setAlarm(alarmAt) {
+    this.alarmAt = alarmAt
   }
 }
 
@@ -44,13 +50,21 @@ class MemoryDurableState {
 class MemoryDurableNamespace {
   coordinators = new Map()
 
+  constructor(Coordinator, getEnvironment) {
+    this.Coordinator = Coordinator
+    this.getEnvironment = getEnvironment
+  }
+
   idFromName(name) {
     return name
   }
 
   get(id) {
     if (!this.coordinators.has(id)) {
-      this.coordinators.set(id, new PollCoordinator(new MemoryDurableState()))
+      this.coordinators.set(id, new this.Coordinator(
+        new MemoryDurableState(),
+        this.getEnvironment?.(),
+      ))
     }
     return {
       fetch: (request) => this.coordinators.get(id).fetch(request),
@@ -61,24 +75,42 @@ class MemoryDurableNamespace {
 class MemoryKv {
   values = new Map()
   metadata = new Map()
+  subrequestCount = 0
+  subrequestLimit = Number.POSITIVE_INFINITY
+
+  consumeSubrequest() {
+    this.subrequestCount += 1
+    if (this.subrequestCount > this.subrequestLimit) {
+      throw new Error(`KV subrequest limit exceeded: ${this.subrequestLimit}`)
+    }
+  }
+
+  resetSubrequests(limit = Number.POSITIVE_INFINITY) {
+    this.subrequestCount = 0
+    this.subrequestLimit = limit
+  }
 
   async get(key, type) {
+    this.consumeSubrequest()
     const value = this.values.get(key)
     if (value === undefined) return null
     return type === 'json' ? JSON.parse(value) : value
   }
 
   async put(key, value, options = {}) {
+    this.consumeSubrequest()
     this.values.set(key, value)
     if (options.metadata) this.metadata.set(key, options.metadata)
   }
 
   async delete(key) {
+    this.consumeSubrequest()
     this.values.delete(key)
     this.metadata.delete(key)
   }
 
   async list({ prefix, limit = 1000 }) {
+    this.consumeSubrequest()
     const keys = [...this.values.keys()]
       .filter((key) => key.startsWith(prefix))
       .sort()
@@ -89,14 +121,22 @@ class MemoryKv {
 }
 
 function createEnvironment(overrides = {}) {
-  return {
+  const environment = {
     POLLS: new MemoryKv(),
-    POLL_COORDINATORS: new MemoryDurableNamespace(),
     MAX_POLL_DATES: 'unlimited',
     MAX_POLL_RESPONSES: '100',
     ALLOWED_ORIGINS: 'https://quintelier.dev',
     ...overrides,
   }
+  environment.POLL_COORDINATORS ||= new MemoryDurableNamespace(
+    PollCoordinator,
+    () => environment,
+  )
+  environment.ACCOUNT_COORDINATORS ||= new MemoryDurableNamespace(
+    AccountCoordinator,
+    () => environment,
+  )
+  return environment
 }
 
 function call(environment, path, options = {}) {
@@ -246,6 +286,594 @@ test('protects poll management and supports the organizer lifecycle', async () =
   })
   assert.equal(deleted.status, 200)
   assert.equal((await call(environment, `/api/polls/${created.id}`)).status, 404)
+})
+
+test('supports account-owned and claimed polls without storing plaintext passwords', async () => {
+  const environment = createEnvironment()
+  const password = 'correct horse battery staple'
+  const registrationResponse = await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'Ada', email: 'ADA@example.com', password }),
+  })
+  assert.equal(registrationResponse.status, 201)
+  const registration = await registrationResponse.json()
+  assert.equal(registration.user.email, 'ada@example.com')
+  assert.match(registration.token, /^[a-f0-9]{64}\.[a-f0-9]{64}$/)
+
+  const [accountKey, sessionSecret] = registration.token.split('.')
+  const accountCoordinator = environment.ACCOUNT_COORDINATORS.coordinators.get(accountKey)
+  const storedAccount = await accountCoordinator.state.storage.get('account')
+  const storedAuthentication = JSON.stringify([...accountCoordinator.state.storage.values.entries()])
+  assert.equal(storedAuthentication.includes(password), false)
+  assert.equal(storedAuthentication.includes(sessionSecret), false)
+  assert.equal(storedAccount.password, undefined)
+  assert.equal(storedAccount.passwordHash.algorithm, 'pbkdf2-sha256')
+  assert.equal(
+    [...accountCoordinator.state.storage.values.keys()].some((key) => key.includes(registration.token)),
+    false,
+  )
+
+  const authorization = { Authorization: `Bearer ${registration.token}` }
+  const created = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    headers: authorization,
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  assert.equal(created.ownerId, undefined)
+  assert.equal(created.ownerKey, undefined)
+  assert.equal((await call(environment, `/api/polls/${created.id}/manage`, {
+    headers: authorization,
+  })).status, 200)
+
+  const anonymous = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  const claimResponse = await call(environment, '/api/account/polls/claim', {
+    method: 'POST',
+    headers: {
+      ...authorization,
+      'X-Rally-Management-Token': anonymous.managementToken,
+    },
+    body: JSON.stringify({ pollId: anonymous.id }),
+  })
+  assert.equal(claimResponse.status, 200)
+  assert.equal((await call(environment, `/api/polls/${anonymous.id}/manage`, {
+    headers: { 'X-Rally-Management-Token': anonymous.managementToken },
+  })).status, 200)
+
+  assert.equal((await call(environment, `/api/polls/${created.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: 'Grace',
+      votes: { [created.options[0].id]: 'yes' },
+    }),
+  })).status, 200)
+
+  const ownedPolls = await (await call(environment, '/api/account/polls', {
+    headers: authorization,
+  })).json()
+  assert.deepEqual(ownedPolls.polls.map(({ id }) => id).sort(), [anonymous.id, created.id].sort())
+  const createdSummary = ownedPolls.polls.find(({ id }) => id === created.id)
+  assert.equal(createdSummary.participantCount, 1)
+  assert.deepEqual(createdSummary.participants, [])
+
+  const wrongPassword = await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'ada@example.com', password: 'not the password' }),
+  })
+  assert.equal(wrongPassword.status, 401)
+  assert.equal((await call(environment, '/api/auth/session', { headers: authorization })).status, 200)
+  assert.equal((await call(environment, '/api/auth/session', {
+    method: 'DELETE',
+    headers: authorization,
+  })).status, 200)
+  assert.equal((await call(environment, '/api/auth/session', { headers: authorization })).status, 401)
+  assert.equal((await call(environment, '/api/polls', {
+    method: 'POST',
+    headers: authorization,
+    body: JSON.stringify(pollDraft(1)),
+  })).status, 401)
+})
+
+test('imports KV-era responses after an account claim is authorized', async () => {
+  const environment = createEnvironment()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  assert.equal((await call(environment, `/api/polls/${poll.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: 'Grace',
+      votes: { [poll.options[0].id]: 'yes' },
+    }),
+  })).status, 200)
+  environment.POLL_COORDINATORS.coordinators.delete(poll.id)
+
+  const registration = await (await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).json()
+  const authorization = { Authorization: `Bearer ${registration.token}` }
+  const claimedPoll = await (await call(environment, '/api/account/polls/claim', {
+    method: 'POST',
+    headers: {
+      ...authorization,
+      'X-Rally-Management-Token': poll.managementToken,
+    },
+    body: JSON.stringify({ pollId: poll.id }),
+  })).json()
+  assert.deepEqual(claimedPoll.participants.map(({ name }) => name), ['Grace'])
+
+  const ownedPolls = await (await call(environment, '/api/account/polls', {
+    headers: authorization,
+  })).json()
+  assert.equal(ownedPolls.polls[0].participantCount, 1)
+})
+
+test('paginates account poll summaries in bounded Worker invocations', async () => {
+  const environment = createEnvironment()
+  const registration = await (await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).json()
+  const [accountKey] = registration.token.split('.')
+  const accountCoordinator = environment.ACCOUNT_COORDINATORS.coordinators.get(accountKey)
+  const pollIds = Array.from({ length: 51 }, (_, index) => index.toString(16).padStart(10, '0'))
+  for (const [index, id] of pollIds.entries()) {
+    const poll = {
+      id,
+      title: `Poll ${index}`,
+      organizer: 'Ada',
+      description: '',
+      location: '',
+      createdAt: new Date(Date.UTC(2026, 0, index + 1)).toISOString(),
+      status: 'open',
+      options: [{ id: '0000000000', date: '2026-08-10', time: '' }],
+      managementTokenHash: '0'.repeat(64),
+      ownerId: registration.user.id,
+      ownerKey: accountKey,
+    }
+    await accountCoordinator.state.storage.put(`poll:${id}`, { id, createdAt: poll.createdAt })
+    environment.POLL_COORDINATORS.get(id)
+    await environment.POLL_COORDINATORS.coordinators
+      .get(id).state.storage.put('poll:details', poll)
+  }
+  const headers = { Authorization: `Bearer ${registration.token}` }
+  environment.POLLS.resetSubrequests(0)
+
+  const firstPage = await (await call(environment, '/api/account/polls', { headers })).json()
+  assert.equal(firstPage.polls.length, 50)
+  assert.equal(firstPage.nextCursor, pollIds[49])
+  const secondPage = await (await call(
+    environment,
+    `/api/account/polls?cursor=${firstPage.nextCursor}`,
+    { headers },
+  )).json()
+  assert.deepEqual(secondPage.polls.map(({ id }) => id), [pollIds[50]])
+  assert.equal(secondPage.nextCursor, undefined)
+  assert.equal(environment.POLLS.subrequestCount, 0)
+})
+
+test('prunes expired and oldest Worker account sessions', async () => {
+  const state = new MemoryDurableState()
+  const coordinator = new AccountCoordinator(state)
+  const account = { id: '0'.repeat(20), email: 'ada@example.com', name: 'Ada' }
+  const now = Date.now()
+  await state.storage.put('account', account)
+  await state.storage.put('session:expired', {
+    accountId: account.id,
+    createdAt: new Date(now - 20_000).toISOString(),
+    expiresAt: new Date(now - 1_000).toISOString(),
+  })
+  for (let index = 0; index < 11; index += 1) {
+    await state.storage.put(`session:active-${index}`, {
+      accountId: account.id,
+      createdAt: new Date(now - (11 - index) * 1_000).toISOString(),
+      expiresAt: new Date(now + 60_000).toISOString(),
+    })
+  }
+
+  const token = await coordinator.createSession('a'.repeat(64), account.id)
+  const sessions = await state.storage.list({ prefix: 'session:' })
+  assert.equal(sessions.size, 10)
+  assert.equal(sessions.has('session:expired'), false)
+  assert.equal(sessions.has('session:active-0'), false)
+  assert.equal(sessions.has('session:active-1'), false)
+  assert.deepEqual(await coordinator.sessionAccount(token.split('.')[1]), account)
+})
+
+test('allows only one account to claim an anonymous poll concurrently', async () => {
+  const environment = createEnvironment()
+  const registrations = await Promise.all(['ada', 'grace'].map(async (name) => {
+    const response = await call(environment, '/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        email: `${name}@example.com`,
+        password: 'correct horse battery staple',
+      }),
+    })
+    return response.json()
+  }))
+  const anonymous = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+
+  const claims = await Promise.all(registrations.map(({ token }) => call(
+    environment,
+    '/api/account/polls/claim',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Rally-Management-Token': anonymous.managementToken,
+      },
+      body: JSON.stringify({ pollId: anonymous.id }),
+    },
+  )))
+
+  assert.deepEqual(claims.map(({ status }) => status).sort(), [200, 409])
+  const winningIndex = claims.findIndex(({ status }) => status === 200)
+  const stalePoll = await environment.POLLS.get(`poll:${anonymous.id}`, 'json')
+  delete stalePoll.ownerId
+  delete stalePoll.ownerKey
+  await environment.POLLS.put(`poll:${anonymous.id}`, JSON.stringify(stalePoll))
+  assert.equal((await call(environment, `/api/polls/${anonymous.id}`, {
+    method: 'PATCH',
+    headers: { 'X-Rally-Management-Token': anonymous.managementToken },
+    body: JSON.stringify({ title: 'Updated after claim' }),
+  })).status, 200)
+  const repairedPoll = await environment.POLLS.get(`poll:${anonymous.id}`, 'json')
+  assert.equal(repairedPoll.ownerId, registrations[winningIndex].user.id)
+
+  const managementStatuses = await Promise.all(registrations.map(({ token }) => call(
+    environment,
+    `/api/polls/${anonymous.id}/manage`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  )))
+  assert.equal(managementStatuses[winningIndex].status, 200)
+  assert.equal(managementStatuses[1 - winningIndex].status, 403)
+})
+
+test('returns a manageable poll when account indexing fails during creation', async () => {
+  const environment = createEnvironment()
+  const registration = await (await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).json()
+  const accountCoordinators = environment.ACCOUNT_COORDINATORS
+  environment.ACCOUNT_COORDINATORS = {
+    idFromName: (name) => accountCoordinators.idFromName(name),
+    get: (id) => {
+      const coordinator = accountCoordinators.get(id)
+      return {
+        fetch: (request) => request.method === 'PUT'
+          && new URL(request.url).pathname === '/polls/reconcile'
+          ? new Response(JSON.stringify({ error: 'Index unavailable.' }), { status: 503 })
+          : coordinator.fetch(request),
+      }
+    },
+  }
+  const originalConsoleError = console.error
+  console.error = () => undefined
+
+  try {
+    const creationResponse = await call(environment, '/api/polls', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${registration.token}` },
+      body: JSON.stringify(pollDraft(1)),
+    })
+    assert.equal(creationResponse.status, 201)
+    const poll = await creationResponse.json()
+    assert.match(poll.managementToken, /^[a-f0-9]{48}$/)
+    assert.equal((await call(environment, `/api/polls/${poll.id}/manage`, {
+      headers: { 'X-Rally-Management-Token': poll.managementToken },
+    })).status, 200)
+    const pollCoordinator = environment.POLL_COORDINATORS.coordinators.get(poll.id)
+    assert.ok(await pollCoordinator.state.storage.get('poll:ownership-sync'))
+    assert.ok(pollCoordinator.state.storage.alarmAt)
+    assert.equal((await call(environment, `/api/polls/${poll.id}`, {
+      method: 'PATCH',
+      headers: { 'X-Rally-Management-Token': poll.managementToken },
+      body: JSON.stringify({ title: 'Edited while indexing is unavailable' }),
+    })).status, 200)
+    assert.equal(
+      (await pollCoordinator.state.storage.get('poll:ownership-sync')).poll.title,
+      'Edited while indexing is unavailable',
+    )
+
+    environment.ACCOUNT_COORDINATORS = accountCoordinators
+    await pollCoordinator.alarm()
+    assert.equal(await pollCoordinator.state.storage.get('poll:ownership-sync'), undefined)
+    assert.equal(
+      (await environment.POLLS.get(`poll:${poll.id}`, 'json')).title,
+      'Edited while indexing is unavailable',
+    )
+    const ownedPolls = await (await call(environment, '/api/account/polls', {
+      headers: { Authorization: `Bearer ${registration.token}` },
+    })).json()
+    assert.deepEqual(ownedPolls.polls.map(({ id }) => id), [poll.id])
+  } finally {
+    environment.ACCOUNT_COORDINATORS = accountCoordinators
+    console.error = originalConsoleError
+  }
+})
+
+test('retries account cleanup without resurrecting a deleted poll', async () => {
+  const environment = createEnvironment()
+  const registration = await (await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).json()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${registration.token}` },
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  const accountCoordinators = environment.ACCOUNT_COORDINATORS
+  environment.ACCOUNT_COORDINATORS = {
+    idFromName: (name) => accountCoordinators.idFromName(name),
+    get: (id) => {
+      const coordinator = accountCoordinators.get(id)
+      return {
+        fetch: (request) => request.method === 'DELETE'
+          && new URL(request.url).pathname === '/polls/reconcile'
+          ? new Response(JSON.stringify({ error: 'Index unavailable.' }), { status: 503 })
+          : coordinator.fetch(request),
+      }
+    },
+  }
+  const originalConsoleError = console.error
+  console.error = () => undefined
+
+  try {
+    assert.equal((await call(environment, `/api/polls/${poll.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Rally-Management-Token': poll.managementToken },
+    })).status, 200)
+    assert.equal((await call(environment, `/api/polls/${poll.id}`)).status, 404)
+    const pollCoordinator = environment.POLL_COORDINATORS.coordinators.get(poll.id)
+    assert.ok(await pollCoordinator.state.storage.get('poll:deletion-sync'))
+    assert.equal(await pollCoordinator.state.storage.get('poll:ownership-sync'), undefined)
+    assert.ok(pollCoordinator.state.storage.alarmAt)
+    const staleOwnedPolls = await (await call(environment, '/api/account/polls', {
+      headers: { Authorization: `Bearer ${registration.token}` },
+    })).json()
+    assert.deepEqual(staleOwnedPolls.polls, [])
+
+    environment.ACCOUNT_COORDINATORS = accountCoordinators
+    await pollCoordinator.alarm()
+    assert.ok(await pollCoordinator.state.storage.get('poll:deletion-sync'))
+    await pollCoordinator.alarm()
+    assert.equal(await pollCoordinator.state.storage.get('poll:deletion-sync'), undefined)
+    assert.equal(await environment.POLLS.get(`poll:${poll.id}`, 'json'), null)
+    const ownedPolls = await (await call(environment, '/api/account/polls', {
+      headers: { Authorization: `Bearer ${registration.token}` },
+    })).json()
+    assert.deepEqual(ownedPolls.polls, [])
+  } finally {
+    environment.ACCOUNT_COORDINATORS = accountCoordinators
+    console.error = originalConsoleError
+  }
+})
+
+test('serializes poll mirror writes before deletion', async () => {
+  const environment = createEnvironment()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  const originalPut = environment.POLLS.put.bind(environment.POLLS)
+  let releaseMirror
+  const mirrorReleased = new Promise((resolve) => { releaseMirror = resolve })
+  let markMirrorStarted
+  const mirrorStarted = new Promise((resolve) => { markMirrorStarted = resolve })
+  environment.POLLS.put = async (key, value, options) => {
+    if (key === `poll:${poll.id}` && JSON.parse(value).title === 'Delayed update') {
+      markMirrorStarted()
+      await mirrorReleased
+    }
+    return originalPut(key, value, options)
+  }
+
+  const update = call(environment, `/api/polls/${poll.id}`, {
+    method: 'PATCH',
+    headers: { 'X-Rally-Management-Token': poll.managementToken },
+    body: JSON.stringify({ title: 'Delayed update' }),
+  })
+  await mirrorStarted
+  let deletionSettled = false
+  const deletion = call(environment, `/api/polls/${poll.id}`, {
+    method: 'DELETE',
+    headers: { 'X-Rally-Management-Token': poll.managementToken },
+  }).then((response) => {
+    deletionSettled = true
+    return response
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(deletionSettled, false)
+
+  releaseMirror()
+  assert.equal((await update).status, 200)
+  assert.equal((await deletion).status, 200)
+  assert.equal(await environment.POLLS.get(`poll:${poll.id}`, 'json'), null)
+})
+
+test('serializes response mirror writes before deletion', async () => {
+  const environment = createEnvironment()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  const originalPut = environment.POLLS.put.bind(environment.POLLS)
+  let releaseMirror
+  const mirrorReleased = new Promise((resolve) => { releaseMirror = resolve })
+  let markMirrorStarted
+  const mirrorStarted = new Promise((resolve) => { markMirrorStarted = resolve })
+  environment.POLLS.put = async (key, value, options) => {
+    if (key.startsWith(`response:${poll.id}:`)) {
+      markMirrorStarted()
+      await mirrorReleased
+    }
+    return originalPut(key, value, options)
+  }
+
+  const responseWrite = call(environment, `/api/polls/${poll.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: 'Ada',
+      votes: { [poll.options[0].id]: 'yes' },
+    }),
+  })
+  await mirrorStarted
+  let deletionSettled = false
+  const deletion = call(environment, `/api/polls/${poll.id}`, {
+    method: 'DELETE',
+    headers: { 'X-Rally-Management-Token': poll.managementToken },
+  }).then((response) => {
+    deletionSettled = true
+    return response
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(deletionSettled, false)
+
+  releaseMirror()
+  assert.equal((await responseWrite).status, 200)
+  assert.equal((await deletion).status, 200)
+  const responses = await environment.POLLS.list({ prefix: `response:${poll.id}:` })
+  assert.deepEqual(responses.keys, [])
+})
+
+test('drains paginated response mirrors before clearing a deletion tombstone', async () => {
+  const environment = createEnvironment()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  await Promise.all(Array.from({ length: 1001 }, (_, index) => environment.POLLS.put(
+    `response:${poll.id}:${String(index).padStart(4, '0')}`,
+    JSON.stringify({ id: String(index) }),
+  )))
+  environment.POLLS.resetSubrequests(1000)
+
+  assert.equal((await call(environment, `/api/polls/${poll.id}`, {
+    method: 'DELETE',
+    headers: { 'X-Rally-Management-Token': poll.managementToken },
+  })).status, 200)
+  const pollCoordinator = environment.POLL_COORDINATORS.coordinators.get(poll.id)
+  assert.equal((await environment.POLLS.list({
+    prefix: `response:${poll.id}:`,
+    limit: 2000,
+  })).keys.length, 101)
+  assert.ok(environment.POLLS.subrequestCount <= 1000)
+  assert.equal(
+    (await pollCoordinator.state.storage.get('poll:deletion-sync')).verificationPending,
+    false,
+  )
+
+  environment.POLLS.resetSubrequests(1000)
+  await pollCoordinator.alarm()
+  assert.ok(await pollCoordinator.state.storage.get('poll:deletion-sync'))
+  assert.deepEqual((await environment.POLLS.list({ prefix: `response:${poll.id}:` })).keys, [])
+  assert.ok(environment.POLLS.subrequestCount <= 1000)
+  environment.POLLS.resetSubrequests(1000)
+  await pollCoordinator.alarm()
+  assert.equal(await pollCoordinator.state.storage.get('poll:deletion-sync'), undefined)
+})
+
+test('keeps organizer-token access available when the account service fails', async () => {
+  const environment = createEnvironment()
+  const poll = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+  environment.ACCOUNT_COORDINATORS = {
+    idFromName: (name) => name,
+    get: () => ({ fetch: () => new Response('{}', { status: 503 }) }),
+  }
+
+  assert.equal((await call(environment, `/api/polls/${poll.id}/manage`, {
+    headers: { 'X-Rally-Management-Token': poll.managementToken },
+  })).status, 200)
+})
+
+test('throttles repeated Worker sign-in attempts', async () => {
+  const environment = createEnvironment()
+  await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const response = await call(environment, '/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'ada@example.com', password: 'incorrect password' }),
+    })
+    assert.equal(response.status, 401)
+  }
+  assert.equal((await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).status, 429)
+
+  const rotatingEnvironment = createEnvironment()
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const response = await call(rotatingEnvironment, '/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'invalid', password: 'incorrect password' }),
+    })
+    assert.equal(response.status, 401)
+  }
+  assert.equal((await call(rotatingEnvironment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'invalid', password: 'incorrect password' }),
+  })).status, 429)
+})
+
+test('throttles Worker account registration before creating another account', async () => {
+  const environment = createEnvironment()
+  const statuses = []
+  for (let attempt = 0; attempt < 11; attempt += 1) {
+    const response = await call(environment, '/api/auth/register', {
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.10' },
+      body: JSON.stringify({
+        name: `Organizer ${attempt}`,
+        email: `organizer-${attempt}@example.com`,
+        password: 'correct horse battery staple',
+      }),
+    })
+    statuses.push(response.status)
+  }
+
+  assert.deepEqual(statuses, [...Array(10).fill(201), 429])
+  assert.equal(environment.ACCOUNT_COORDINATORS.coordinators.size, 11)
 })
 
 test('enforces a configured date limit', async () => {
@@ -506,6 +1134,7 @@ test('returns configuration, management CORS methods, and rejects unapproved ori
     preflightResponse.headers.get('Access-Control-Allow-Methods'),
     'GET, POST, PUT, PATCH, DELETE, OPTIONS',
   )
+  assert.match(preflightResponse.headers.get('Access-Control-Allow-Headers'), /Authorization/)
 
   const rejectedResponse = await worker.fetch(
     new Request('https://rally-api.example/api/health', {

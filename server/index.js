@@ -11,9 +11,29 @@ const dataDirectory = path.join(rootDirectory, 'data')
 const dataFile = process.env.RALLY_DATA_FILE
   ? path.resolve(process.env.RALLY_DATA_FILE)
   : path.join(dataDirectory, 'polls.json')
+const authDataFile = process.env.RALLY_AUTH_DATA_FILE
+  ? path.resolve(process.env.RALLY_AUTH_DATA_FILE)
+  : path.join(dataDirectory, 'auth.json')
 const distDirectory = path.join(rootDirectory, 'dist')
 const port = Number(process.env.PORT) || 4174
 const defaultMaxPollResponses = 100
+const passwordIterations = 310_000
+const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000
+const maxActiveSessions = 10
+const failedLoginWindowMs = 15 * 60 * 1000
+const loginLockMs = 15 * 60 * 1000
+const maxFailedLoginAttempts = 5
+const loginRateWindowMs = 10 * 60 * 1000
+const maxLoginAttemptsPerIp = 30
+const registrationRateWindowMs = 60 * 60 * 1000
+const maxRegistrationAttemptsPerIp = 10
+const maxRateLimitBuckets = 10_000
+const rateLimitSweepIntervalMs = 60 * 1000
+const failedLoginAttempts = new Map()
+const loginAttemptsByIp = new Map()
+const registrationAttemptsByIp = new Map()
+const loginQueues = new Map()
+const rateLimitSweepTimes = new WeakMap()
 
 function parseMaxDates(value) {
   const normalizedValue = value?.trim().toLowerCase()
@@ -63,6 +83,50 @@ function updatePolls(updater) {
   return update
 }
 
+async function readAuthData() {
+  try {
+    const data = JSON.parse(await fs.readFile(authDataFile, 'utf8'))
+    return {
+      accounts: Array.isArray(data.accounts) ? data.accounts : [],
+      sessions: Array.isArray(data.sessions) ? data.sessions : [],
+    }
+  } catch (error) {
+    if (error.code === 'ENOENT') return { accounts: [], sessions: [] }
+    throw error
+  }
+}
+
+let authWriteQueue = Promise.resolve()
+
+async function writeAuthData(data) {
+  await fs.mkdir(path.dirname(authDataFile), { recursive: true })
+  const temporaryFile = `${authDataFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  let handle
+  try {
+    handle = await fs.open(temporaryFile, 'wx', 0o600)
+    await handle.writeFile(JSON.stringify(data, null, 2), 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await fs.rename(temporaryFile, authDataFile)
+  } finally {
+    if (handle) await handle.close().catch(() => undefined)
+    await fs.rm(temporaryFile, { force: true }).catch(() => undefined)
+  }
+}
+
+function updateAuthData(updater) {
+  const update = authWriteQueue.then(async () => {
+    const data = await readAuthData()
+    const result = await updater(data)
+    await writeAuthData(data)
+    return result
+  })
+
+  authWriteQueue = update.catch(() => undefined)
+  return update
+}
+
 function cleanText(value, maxLength) {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : ''
 }
@@ -82,10 +146,171 @@ function hashParticipantToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex')
 }
 
+function normalizeEmail(value) {
+  return cleanText(value, 254).toLowerCase()
+}
+
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+}
+
+function publicAccount(account) {
+  return { id: account.id, email: account.email, name: account.name }
+}
+
+function derivePasswordHash(password, salt, iterations = passwordIterations) {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, Buffer.from(salt, 'hex'), iterations, 32, 'sha256', (error, hash) => {
+      if (error) reject(error)
+      else resolve(hash.toString('hex'))
+    })
+  })
+}
+
+async function passwordRecord(password) {
+  const salt = crypto.randomBytes(16).toString('hex')
+  return {
+    algorithm: 'pbkdf2-sha256',
+    iterations: passwordIterations,
+    salt,
+    hash: await derivePasswordHash(password, salt),
+  }
+}
+
+async function passwordMatches(password, record) {
+  if (record?.algorithm !== 'pbkdf2-sha256'
+    || !Number.isSafeInteger(record.iterations)
+    || !/^[a-f0-9]{32}$/.test(record.salt || '')
+    || !/^[a-f0-9]{64}$/.test(record.hash || '')) return false
+  const candidate = await derivePasswordHash(password, record.salt, record.iterations)
+  return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(record.hash, 'hex'))
+}
+
+const dummyPasswordRecord = {
+  algorithm: 'pbkdf2-sha256',
+  iterations: passwordIterations,
+  salt: '00000000000000000000000000000000',
+  hash: '0000000000000000000000000000000000000000000000000000000000000000',
+}
+
+function pruneRateLimitBuckets(buckets, now, force = false) {
+  const nextSweepAt = rateLimitSweepTimes.get(buckets) || 0
+  if (!force && now < nextSweepAt) return
+  for (const [key, bucket] of buckets) {
+    if (!(bucket.resetAt > now)) buckets.delete(key)
+  }
+  rateLimitSweepTimes.set(buckets, now + rateLimitSweepIntervalMs)
+}
+
+export function consumeRateLimit(
+  buckets,
+  key,
+  maxAttempts,
+  windowMs,
+  now = Date.now(),
+  bucketLimit = maxRateLimitBuckets,
+) {
+  pruneRateLimitBuckets(buckets, now)
+  let current = buckets.get(key)
+  if (current && !(current.resetAt > now)) {
+    buckets.delete(key)
+    current = null
+  }
+  if (!current && buckets.size >= bucketLimit) {
+    pruneRateLimitBuckets(buckets, now, true)
+    if (buckets.size >= bucketLimit) return false
+  }
+  if (current?.count >= maxAttempts) return false
+  buckets.set(key, {
+    count: current ? current.count + 1 : 1,
+    resetAt: current ? current.resetAt : now + windowMs,
+  })
+  return true
+}
+
+function consumeLoginRateLimit(request) {
+  return consumeRateLimit(
+    loginAttemptsByIp,
+    request.socket.remoteAddress || 'unknown',
+    maxLoginAttemptsPerIp,
+    loginRateWindowMs,
+  )
+}
+
+function consumeRegistrationRateLimit(request) {
+  return consumeRateLimit(
+    registrationAttemptsByIp,
+    request.socket.remoteAddress || 'unknown',
+    maxRegistrationAttemptsPerIp,
+    registrationRateWindowMs,
+  )
+}
+
+function recordFailedLogin(accountId) {
+  const now = Date.now()
+  const current = failedLoginAttempts.get(accountId)
+  const active = current && current.firstAttemptAt > now - failedLoginWindowMs
+  const count = active ? current.count + 1 : 1
+  failedLoginAttempts.set(accountId, {
+    count,
+    firstAttemptAt: active ? current.firstAttemptAt : now,
+    blockedUntil: count >= maxFailedLoginAttempts ? now + loginLockMs : 0,
+  })
+}
+
+function serializeLogin(email, operation) {
+  const previous = loginQueues.get(email) || Promise.resolve()
+  const current = previous.catch(() => undefined).then(operation)
+  loginQueues.set(email, current)
+  return current.finally(() => {
+    if (loginQueues.get(email) === current) loginQueues.delete(email)
+  })
+}
+
+function requestSessionToken(request) {
+  const match = /^Bearer ([a-f0-9]{64})$/i.exec(cleanText(request.get('Authorization'), 80))
+  return match?.[1].toLowerCase() || ''
+}
+
+function addSession(data, accountId) {
+  const now = Date.now()
+  data.sessions = data.sessions.filter(({ expiresAt }) => Date.parse(expiresAt) > now)
+  const accountSessions = data.sessions
+    .filter((session) => session.accountId === accountId)
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+  const retainedSessions = new Set(accountSessions.slice(0, maxActiveSessions - 1))
+  data.sessions = data.sessions.filter((session) => (
+    session.accountId !== accountId || retainedSessions.has(session)
+  ))
+  const token = crypto.randomBytes(32).toString('hex')
+  data.sessions.push({
+    tokenHash: hashParticipantToken(token),
+    accountId,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + sessionLifetimeMs).toISOString(),
+  })
+  return token
+}
+
+async function authenticatedAccount(request) {
+  const token = requestSessionToken(request)
+  if (!token) return null
+  const data = await readAuthData()
+  const tokenHash = hashParticipantToken(token)
+  const session = data.sessions.find((item) => item.tokenHash === tokenHash
+    && Date.parse(item.expiresAt) > Date.now())
+  return session ? data.accounts.find(({ id }) => id === session.accountId) || null : null
+}
+
 function serializePoll(poll, participantToken = '') {
   const tokenHash = participantToken ? hashParticipantToken(participantToken) : ''
   let viewerParticipantId
-  const { managementTokenHash: _managementTokenHash, participants: storedParticipants, ...details } = poll
+  const {
+    managementTokenHash: _managementTokenHash,
+    ownerId: _ownerId,
+    participants: storedParticipants,
+    ...details
+  } = poll
   const participants = storedParticipants.map(({ editTokenHash, ...participant }) => {
     if (tokenHash && editTokenHash === tokenHash) viewerParticipantId = participant.id
     return participant
@@ -97,7 +322,8 @@ function serializePoll(poll, participantToken = '') {
   }
 }
 
-function hasManagementAccess(request, poll) {
+function hasManagementAccess(request, poll, account) {
+  if (account && poll.ownerId === account.id) return true
   const token = cleanText(request.get('X-Rally-Management-Token'), 64)
   if (!/^[a-f0-9]{48}$/.test(token) || !/^[a-f0-9]{64}$/.test(poll.managementTokenHash || '')) {
     return false
@@ -165,6 +391,142 @@ app.get('/api/config', (_request, response) => {
   response.json({ maxDates: maxPollDates })
 })
 
+app.post('/api/auth/register', async (request, response, next) => {
+  try {
+    const email = normalizeEmail(request.body.email)
+    const name = cleanText(request.body.name, 60)
+    const password = typeof request.body.password === 'string' ? request.body.password : ''
+    if (!validEmail(email) || !name || password.length < 10 || password.length > 128) {
+      return response.status(400).json({
+        error: 'Enter a name, a valid email, and a password of 10 to 128 characters.',
+      })
+    }
+    if (!consumeRegistrationRateLimit(request)) {
+      return response.status(429).json({
+        error: 'Too many account registrations. Try again later.',
+      })
+    }
+
+    const passwordHash = await passwordRecord(password)
+    const result = await updateAuthData((data) => {
+      if (data.accounts.some((account) => account.email === email)) {
+        return { error: 'An account with that email already exists.' }
+      }
+      const account = {
+        id: crypto.randomBytes(10).toString('hex'),
+        email,
+        name,
+        passwordHash,
+        createdAt: new Date().toISOString(),
+      }
+      data.accounts.push(account)
+      return { user: publicAccount(account), token: addSession(data, account.id) }
+    })
+
+    if (result.error) return response.status(409).json({ error: result.error })
+    return response.status(201).json(result)
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.post('/api/auth/login', async (request, response, next) => {
+  try {
+    const email = normalizeEmail(request.body.email)
+    const password = typeof request.body.password === 'string' ? request.body.password : ''
+    if (!consumeLoginRateLimit(request)) {
+      return response.status(429).json({ error: 'Too many sign-in attempts. Try again later.' })
+    }
+    if (!validEmail(email) || !password || password.length > 128) {
+      return response.status(401).json({ error: 'Email or password is incorrect.' })
+    }
+    const result = await serializeLogin(email, async () => {
+      const data = await readAuthData()
+      const account = data.accounts.find((item) => item.email === email)
+      const currentFailure = account ? failedLoginAttempts.get(account.id) : null
+      if (currentFailure?.blockedUntil > Date.now()) {
+        return { status: 429, error: 'Too many sign-in attempts. Try again later.' }
+      }
+      const matches = account
+        ? await passwordMatches(password, account.passwordHash)
+        : await passwordMatches(password, dummyPasswordRecord)
+      if (!account || !matches) {
+        if (account) recordFailedLogin(account.id)
+        return { status: 401, error: 'Email or password is incorrect.' }
+      }
+      failedLoginAttempts.delete(account.id)
+      const token = await updateAuthData((currentData) => addSession(currentData, account.id))
+      return { status: 200, user: publicAccount(account), token }
+    })
+    if (result.error) return response.status(result.status).json({ error: result.error })
+    return response.json({ user: result.user, token: result.token })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/auth/session', async (request, response, next) => {
+  try {
+    const account = await authenticatedAccount(request)
+    if (!account) return response.status(401).json({ error: 'Sign in required.' })
+    return response.json({ user: publicAccount(account) })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.delete('/api/auth/session', async (request, response, next) => {
+  try {
+    const token = requestSessionToken(request)
+    if (token) {
+      const tokenHash = hashParticipantToken(token)
+      await updateAuthData((data) => {
+        data.sessions = data.sessions.filter((session) => session.tokenHash !== tokenHash)
+      })
+    }
+    return response.json({ signedOut: true })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/account/polls', async (request, response, next) => {
+  try {
+    const account = await authenticatedAccount(request)
+    if (!account) return response.status(401).json({ error: 'Sign in required.' })
+    const polls = await readPolls()
+    return response.json({
+      polls: polls.filter(({ ownerId }) => ownerId === account.id).map((poll) => serializePoll(poll)),
+    })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.post('/api/account/polls/claim', async (request, response, next) => {
+  try {
+    const account = await authenticatedAccount(request)
+    if (!account) return response.status(401).json({ error: 'Sign in required.' })
+    const pollId = cleanText(request.body.pollId, 20)
+    const result = await updatePolls((polls) => {
+      const poll = polls.find(({ id }) => id === pollId)
+      if (!poll) return { status: 404, error: 'Poll not found.' }
+      if (poll.ownerId && poll.ownerId !== account.id) {
+        return { status: 409, error: 'This poll already belongs to another account.' }
+      }
+      if (!hasManagementAccess(request, poll, null)) {
+        return { status: 403, error: 'Organizer access required.' }
+      }
+      poll.ownerId = account.id
+      return { poll: serializePoll(poll) }
+    })
+    if (result.error) return response.status(result.status).json({ error: result.error })
+    return response.json(result.poll)
+  } catch (error) {
+    return next(error)
+  }
+})
+
 app.post('/api/polls', async (request, response, next) => {
   try {
     const title = cleanText(request.body.title, 100)
@@ -177,6 +539,10 @@ app.post('/api/polls', async (request, response, next) => {
       })
     }
 
+    const account = await authenticatedAccount(request)
+    if (request.get('Authorization') && !account) {
+      return response.status(401).json({ error: 'Sign in required.' })
+    }
     const poll = {
       id: crypto.randomBytes(5).toString('hex'),
       title,
@@ -191,6 +557,7 @@ app.post('/api/polls', async (request, response, next) => {
         time: cleanText(option.time, 5),
       })),
       participants: [],
+      ...(account ? { ownerId: account.id } : {}),
     }
 
     const managementToken = crypto.randomBytes(24).toString('hex')
@@ -220,7 +587,10 @@ app.get('/api/polls/:pollId/manage', async (request, response, next) => {
     const polls = await readPolls()
     const poll = polls.find((item) => item.id === request.params.pollId)
     if (!poll) return response.status(404).json({ error: 'Poll not found.' })
-    if (!hasManagementAccess(request, poll)) {
+    const account = hasManagementAccess(request, poll, null)
+      ? null
+      : await authenticatedAccount(request)
+    if (!hasManagementAccess(request, poll, account)) {
       return response.status(403).json({ error: 'Organizer access required.' })
     }
     return response.json(serializePoll(poll))
@@ -239,10 +609,14 @@ app.patch('/api/polls/:pollId', async (request, response, next) => {
       return response.status(400).json({ error: 'Poll status must be open or closed.' })
     }
 
+    const existingPoll = (await readPolls()).find((item) => item.id === request.params.pollId)
+    const account = existingPoll && !hasManagementAccess(request, existingPoll, null)
+      ? await authenticatedAccount(request)
+      : null
     const result = await updatePolls((polls) => {
       const poll = polls.find((item) => item.id === request.params.pollId)
       if (!poll) return { status: 404, error: 'Poll not found.' }
-      if (!hasManagementAccess(request, poll)) {
+      if (!hasManagementAccess(request, poll, account)) {
         return { status: 403, error: 'Organizer access required.' }
       }
 
@@ -281,10 +655,14 @@ app.patch('/api/polls/:pollId', async (request, response, next) => {
 
 app.delete('/api/polls/:pollId', async (request, response, next) => {
   try {
+    const existingPoll = (await readPolls()).find((item) => item.id === request.params.pollId)
+    const account = existingPoll && !hasManagementAccess(request, existingPoll, null)
+      ? await authenticatedAccount(request)
+      : null
     const result = await updatePolls((polls) => {
       const pollIndex = polls.findIndex((item) => item.id === request.params.pollId)
       if (pollIndex < 0) return { status: 404, error: 'Poll not found.' }
-      if (!hasManagementAccess(request, polls[pollIndex])) {
+      if (!hasManagementAccess(request, polls[pollIndex], account)) {
         return { status: 403, error: 'Organizer access required.' }
       }
       polls.splice(pollIndex, 1)

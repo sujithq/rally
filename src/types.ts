@@ -26,6 +26,7 @@ export interface Poll {
   status: 'open' | 'closed'
   options: PollOption[]
   participants: Participant[]
+  participantCount?: number
   viewerParticipantId?: string
 }
 
@@ -58,4 +59,15 @@ export interface ManagedPollReference {
 export interface SavedResponse {
   poll: Poll
   participantId: string
+}
+
+export interface AccountUser {
+  id: string
+  email: string
+  name: string
+}
+
+export interface AuthSession {
+  user: AccountUser
+  token: string
 }

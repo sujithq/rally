@@ -9,26 +9,32 @@ import {
   Trash2,
   Users,
 } from 'lucide-react'
-import { getManagedPoll } from './api'
+import { getAccountPolls, getManagedPoll } from './api'
 import { formatDate } from './date'
 import {
   forgetManagedPoll,
   getManagedPollReferences,
   inviteUrl,
 } from './managedPolls'
-import type { ManagedPollReference, Poll } from './types'
+import type { AccountUser, Poll } from './types'
+
+interface ManagementReference {
+  id: string
+  managementToken?: string
+}
 
 interface ManagedPollItem {
-  reference: ManagedPollReference
+  reference: ManagementReference
   poll?: Poll
   error?: string
 }
 
 interface ManagePollsProps {
+  user: AccountUser | null
   onNavigate: (path: string) => void
 }
 
-export default function ManagePolls({ onNavigate }: ManagePollsProps) {
+export default function ManagePolls({ user, onNavigate }: ManagePollsProps) {
   const [items, setItems] = useState<ManagedPollItem[]>([])
   const [loading, setLoading] = useState(true)
   const [copiedPollId, setCopiedPollId] = useState('')
@@ -37,7 +43,7 @@ export default function ManagePolls({ onNavigate }: ManagePollsProps) {
   useEffect(() => {
     let active = true
     const references = getManagedPollReferences()
-    Promise.all(references.map(async (reference) => {
+    const localPolls = Promise.all(references.map(async (reference) => {
       try {
         return { reference, poll: await getManagedPoll(reference.id, reference.managementToken) }
       } catch (error) {
@@ -46,16 +52,25 @@ export default function ManagePolls({ onNavigate }: ManagePollsProps) {
           error: error instanceof Error ? error.message : 'Poll unavailable.',
         }
       }
-    })).then((loadedItems) => {
+    }))
+    const accountPolls = user
+      ? getAccountPolls().then(({ polls }) => polls).catch(() => [])
+      : Promise.resolve([])
+
+    Promise.all([localPolls, accountPolls]).then(([loadedLocalPolls, loadedAccountPolls]) => {
       if (active) {
-        setItems(loadedItems)
+        const accountPollIds = new Set(loadedAccountPolls.map(({ id }) => id))
+        setItems([
+          ...loadedAccountPolls.map((poll) => ({ reference: { id: poll.id }, poll })),
+          ...loadedLocalPolls.filter(({ reference }) => !accountPollIds.has(reference.id)),
+        ])
         setLoading(false)
       }
     })
     return () => {
       active = false
     }
-  }, [])
+  }, [user])
 
   const copyInvite = async (pollId: string) => {
     try {
@@ -109,7 +124,9 @@ export default function ManagePolls({ onNavigate }: ManagePollsProps) {
                     <h2>{poll.title}</h2>
                     <div className="managed-poll-meta">
                       <span><CalendarDays size={15} /> {poll.options.length} dates</span>
-                      <span><Users size={15} /> {poll.participants.length} responses</span>
+                      <span>
+                        <Users size={15} /> {poll.participantCount ?? poll.participants.length} responses
+                      </span>
                       <span>First option {formatDate(poll.options[0].date)}</span>
                     </div>
                   </div>
@@ -117,7 +134,9 @@ export default function ManagePolls({ onNavigate }: ManagePollsProps) {
                     <button
                       className="button button-small button-dark"
                       type="button"
-                      onClick={() => onNavigate(`/manage/${reference.id}/${reference.managementToken}`)}
+                      onClick={() => onNavigate(reference.managementToken
+                        ? `/manage/${reference.id}/${reference.managementToken}`
+                        : `/manage/${reference.id}`)}
                     >
                       <Settings2 size={16} /> Manage
                     </button>
@@ -147,15 +166,17 @@ export default function ManagePolls({ onNavigate }: ManagePollsProps) {
                     <span className="managed-poll-error"><AlertCircle size={16} /> {error}</span>
                     <h2>Poll {reference.id}</h2>
                   </div>
-                  <button
-                    className="icon-button icon-button-danger"
-                    type="button"
-                    onClick={() => removeReference(reference.id)}
-                    aria-label={`Remove poll ${reference.id}`}
-                    title="Remove from My polls"
-                  >
-                    <Trash2 size={17} />
-                  </button>
+                  {reference.managementToken && (
+                    <button
+                      className="icon-button icon-button-danger"
+                      type="button"
+                      onClick={() => removeReference(reference.id)}
+                      aria-label={`Remove poll ${reference.id}`}
+                      title="Remove from My polls"
+                    >
+                      <Trash2 size={17} />
+                    </button>
+                  )}
                 </>
               )}
             </article>

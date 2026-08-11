@@ -1,6 +1,8 @@
 node_modules/
 dist/
 data/polls.json
+data/auth.json
+data/auth.json.*.tmp
 .env
 .dev.vars
 .wrangler/

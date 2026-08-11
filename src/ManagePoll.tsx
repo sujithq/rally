@@ -33,7 +33,7 @@ interface EditableOption extends PollOptionInput {
 
 interface ManagePollProps {
   pollId: string
-  managementToken: string
+  managementToken?: string
   maxDates: number | null
   onNavigate: (path: string) => void
 }
@@ -79,7 +79,7 @@ export default function ManagePoll({
       .then((nextPoll) => {
         if (!active) return
         applyPoll(nextPoll)
-        rememberManagedPoll(reference)
+        if (managementToken) rememberManagedPoll({ id: pollId, managementToken })
       })
       .catch((requestError) => {
         if (active) {
@@ -142,9 +142,12 @@ export default function ManagePoll({
   }
 
   const copyLink = async (kind: 'invite' | 'management') => {
+    if (kind === 'management' && !managementToken) return
     try {
       await navigator.clipboard.writeText(
-        kind === 'invite' ? inviteUrl(pollId) : managementUrl(reference),
+        kind === 'invite'
+          ? inviteUrl(pollId)
+          : managementUrl({ id: pollId, managementToken: managementToken! }),
       )
       setCopied(kind)
       window.setTimeout(() => setCopied(''), 1800)
@@ -214,9 +217,11 @@ export default function ManagePoll({
           <button className="icon-button" type="button" onClick={() => void copyLink('invite')} title="Copy invite" aria-label="Copy invite">
             {copied === 'invite' ? <CheckCircle2 size={17} /> : <Copy size={17} />}
           </button>
-          <button className="icon-button" type="button" onClick={() => void copyLink('management')} title="Copy management link" aria-label="Copy management link">
-            {copied === 'management' ? <CheckCircle2 size={17} /> : <Link2 size={17} />}
-          </button>
+          {managementToken && (
+            <button className="icon-button" type="button" onClick={() => void copyLink('management')} title="Copy management link" aria-label="Copy management link">
+              {copied === 'management' ? <CheckCircle2 size={17} /> : <Link2 size={17} />}
+            </button>
+          )}
         </div>
       </section>
 
