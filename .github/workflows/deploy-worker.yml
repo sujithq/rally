@@ -39,7 +39,7 @@ jobs:
 
       - name: Prepare production Worker configuration
         env:
-          KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
           MAX_POLL_DATES: ${{ vars.MAX_POLL_DATES }}
           MAX_POLL_RESPONSES: ${{ vars.MAX_POLL_RESPONSES }}
           ALLOWED_ORIGINS: ${{ vars.ALLOWED_ORIGINS }}
