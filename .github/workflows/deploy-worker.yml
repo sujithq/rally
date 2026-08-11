@@ -57,6 +57,35 @@ jobs:
           }
           NODE
 
+      - name: Verify Cloudflare Worker access
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs'
+          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+          const url = new URL(
+            `/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/services/${config.name}`,
+            'https://api.cloudflare.com',
+          )
+          const response = await fetch(url, {
+            headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+          })
+          const payload = await response.json()
+          const errors = Array.isArray(payload.errors) ? payload.errors : []
+          if (errors.some((error) => error.code === 10000)) {
+            throw new Error(
+              'CLOUDFLARE_API_TOKEN cannot access Workers for this account. '
+              + 'Create it from the Edit Cloudflare Workers template and scope it to CLOUDFLARE_ACCOUNT_ID.',
+            )
+          }
+          if (!response.ok && response.status !== 404) {
+            const details = errors.map((error) => `${error.code}: ${error.message}`).join('; ')
+            throw new Error(`Cloudflare Worker access check failed${details ? `: ${details}` : '.'}`)
+          }
+          NODE
+
       - name: Install dependencies
         run: npm ci
 

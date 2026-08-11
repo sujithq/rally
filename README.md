@@ -14,7 +14,7 @@ npm run dev
 ## Deployment setup
 
 1. Create a Workers KV namespace in Cloudflare and copy its 32-character namespace ID.
-2. Create a Cloudflare API token that can edit Workers scripts. Copy the Cloudflare account ID as well.
+2. In Cloudflare **Manage Account > Account API Tokens**, create a token from the **Edit Cloudflare Workers** template. Scope its account resources to the same account whose ID you copy. A custom token must include at least **Workers Scripts Write/Edit**, **Workers KV Storage Write/Edit**, and **Account Settings Read** for that account.
 3. Add GitHub Actions repository secrets named `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_KV_NAMESPACE_ID`.
 4. Keep the KV namespace name for your own reference; deployment only needs its 32-character namespace ID.
 5. Run the **Deploy Cloudflare Worker** workflow once and copy the Worker URL from its job summary.
