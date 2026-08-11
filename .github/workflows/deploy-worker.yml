@@ -31,6 +31,32 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Validate Cloudflare secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+        run: |
+          node <<'NODE'
+          const requiredSecrets = {
+            CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+            CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
+            CLOUDFLARE_KV_NAMESPACE_ID: process.env.CLOUDFLARE_KV_NAMESPACE_ID,
+          }
+          const missingSecrets = Object.entries(requiredSecrets)
+            .filter(([, value]) => !value?.trim())
+            .map(([name]) => name)
+          if (missingSecrets.length) {
+            throw new Error(`Add these GitHub Actions repository secrets: ${missingSecrets.join(', ')}`)
+          }
+          if (!/^[a-f0-9]{32}$/i.test(requiredSecrets.CLOUDFLARE_ACCOUNT_ID.trim())) {
+            throw new Error('CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID.')
+          }
+          if (!/^[a-f0-9]{32}$/i.test(requiredSecrets.CLOUDFLARE_KV_NAMESPACE_ID.trim())) {
+            throw new Error('CLOUDFLARE_KV_NAMESPACE_ID must be a 32-character Workers KV namespace ID.')
+          }
+          NODE
+
       - name: Install dependencies
         run: npm ci
 
@@ -48,7 +74,7 @@ jobs:
           const fs = require('node:fs')
           const namespaceId = process.env.KV_NAMESPACE_ID?.trim()
           if (!/^[a-f0-9]{32}$/i.test(namespaceId || '')) {
-            throw new Error('Set CLOUDFLARE_KV_NAMESPACE_ID as a GitHub repository variable.')
+            throw new Error('Set CLOUDFLARE_KV_NAMESPACE_ID as a GitHub Actions repository secret.')
           }
 
           const maxDates = process.env.MAX_POLL_DATES?.trim() || 'unlimited'
