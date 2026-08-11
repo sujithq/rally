@@ -85,14 +85,52 @@ function hashParticipantToken(token) {
 function serializePoll(poll, participantToken = '') {
   const tokenHash = participantToken ? hashParticipantToken(participantToken) : ''
   let viewerParticipantId
-  const participants = poll.participants.map(({ editTokenHash, ...participant }) => {
+  const { managementTokenHash: _managementTokenHash, participants: storedParticipants, ...details } = poll
+  const participants = storedParticipants.map(({ editTokenHash, ...participant }) => {
     if (tokenHash && editTokenHash === tokenHash) viewerParticipantId = participant.id
     return participant
   })
   return {
-    ...poll,
+    ...details,
     participants,
     ...(viewerParticipantId ? { viewerParticipantId } : {}),
+  }
+}
+
+function hasManagementAccess(request, poll) {
+  const token = cleanText(request.get('X-Rally-Management-Token'), 64)
+  if (!/^[a-f0-9]{48}$/.test(token) || !/^[a-f0-9]{64}$/.test(poll.managementTokenHash || '')) {
+    return false
+  }
+  return crypto.timingSafeEqual(
+    Buffer.from(hashParticipantToken(token), 'hex'),
+    Buffer.from(poll.managementTokenHash, 'hex'),
+  )
+}
+
+function updatedOptions(options, currentPoll) {
+  const existingIds = new Set(currentPoll.options.map(({ id }) => id))
+  const usedIds = new Set()
+  return options.map((option) => {
+    const requestedId = cleanText(option?.id, 20)
+    const id = existingIds.has(requestedId) && !usedIds.has(requestedId)
+      ? requestedId
+      : crypto.randomBytes(5).toString('hex')
+    usedIds.add(id)
+    return {
+      id,
+      date: cleanText(option.date, 10),
+      time: cleanText(option.time, 5),
+    }
+  })
+}
+
+function normalizeParticipantVotes(participants, options) {
+  for (const participant of participants) {
+    participant.votes = Object.fromEntries(options.map(({ id }) => [
+      id,
+      ['yes', 'maybe', 'no'].includes(participant.votes[id]) ? participant.votes[id] : 'no',
+    ]))
   }
 }
 
@@ -155,8 +193,11 @@ app.post('/api/polls', async (request, response, next) => {
       participants: [],
     }
 
+    const managementToken = crypto.randomBytes(24).toString('hex')
+    poll.managementTokenHash = hashParticipantToken(managementToken)
+
     await updatePolls((polls) => polls.push(poll))
-    return response.status(201).json(serializePoll(poll))
+    return response.status(201).json({ ...serializePoll(poll), managementToken })
   } catch (error) {
     return next(error)
   }
@@ -174,6 +215,89 @@ app.get('/api/polls/:pollId', async (request, response, next) => {
   }
 })
 
+app.get('/api/polls/:pollId/manage', async (request, response, next) => {
+  try {
+    const polls = await readPolls()
+    const poll = polls.find((item) => item.id === request.params.pollId)
+    if (!poll) return response.status(404).json({ error: 'Poll not found.' })
+    if (!hasManagementAccess(request, poll)) {
+      return response.status(403).json({ error: 'Organizer access required.' })
+    }
+    return response.json(serializePoll(poll))
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.patch('/api/polls/:pollId', async (request, response, next) => {
+  try {
+    const optionsError = request.body.options === undefined
+      ? null
+      : validateOptions(request.body.options)
+    if (optionsError) return response.status(400).json({ error: optionsError })
+    if (request.body.status !== undefined && !['open', 'closed'].includes(request.body.status)) {
+      return response.status(400).json({ error: 'Poll status must be open or closed.' })
+    }
+
+    const result = await updatePolls((polls) => {
+      const poll = polls.find((item) => item.id === request.params.pollId)
+      if (!poll) return { status: 404, error: 'Poll not found.' }
+      if (!hasManagementAccess(request, poll)) {
+        return { status: 403, error: 'Organizer access required.' }
+      }
+
+      const title = request.body.title === undefined
+        ? poll.title
+        : cleanText(request.body.title, 100)
+      const organizer = request.body.organizer === undefined
+        ? poll.organizer
+        : cleanText(request.body.organizer, 60)
+      if (!title || !organizer) {
+        return { status: 400, error: 'A title and organizer name are required.' }
+      }
+
+      poll.title = title
+      poll.organizer = organizer
+      poll.description = request.body.description === undefined
+        ? poll.description
+        : cleanText(request.body.description, 500)
+      poll.location = request.body.location === undefined
+        ? poll.location
+        : cleanText(request.body.location, 120)
+      poll.status = request.body.status ?? poll.status
+      if (request.body.options !== undefined) {
+        poll.options = updatedOptions(request.body.options, poll)
+        normalizeParticipantVotes(poll.participants, poll.options)
+      }
+      return { poll: serializePoll(poll) }
+    })
+
+    if (result.error) return response.status(result.status).json({ error: result.error })
+    return response.json(result.poll)
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.delete('/api/polls/:pollId', async (request, response, next) => {
+  try {
+    const result = await updatePolls((polls) => {
+      const pollIndex = polls.findIndex((item) => item.id === request.params.pollId)
+      if (pollIndex < 0) return { status: 404, error: 'Poll not found.' }
+      if (!hasManagementAccess(request, polls[pollIndex])) {
+        return { status: 403, error: 'Organizer access required.' }
+      }
+      polls.splice(pollIndex, 1)
+      return { deleted: true }
+    })
+
+    if (result.error) return response.status(result.status).json({ error: result.error })
+    return response.json(result)
+  } catch (error) {
+    return next(error)
+  }
+})
+
 app.put('/api/polls/:pollId/responses', async (request, response, next) => {
   try {
     const name = cleanText(request.body.name, 60)
@@ -183,6 +307,7 @@ app.put('/api/polls/:pollId/responses', async (request, response, next) => {
     const result = await updatePolls((polls) => {
       const currentPoll = polls.find((item) => item.id === request.params.pollId)
       if (!currentPoll) return null
+      if (currentPoll.status === 'closed') return { pollClosed: true }
 
       const votes = Object.fromEntries(
         currentPoll.options.map((option) => {
@@ -220,6 +345,7 @@ app.put('/api/polls/:pollId/responses', async (request, response, next) => {
     })
 
     if (!result) return response.status(404).json({ error: 'Poll not found.' })
+    if (result.pollClosed) return response.status(409).json({ error: 'This poll is closed.' })
     if (result.responseLimitReached) {
       return response.status(409).json({ error: 'This poll has reached its response limit.' })
     }

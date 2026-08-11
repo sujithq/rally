@@ -73,6 +73,11 @@ class MemoryKv {
     if (options.metadata) this.metadata.set(key, options.metadata)
   }
 
+  async delete(key) {
+    this.values.delete(key)
+    this.metadata.delete(key)
+  }
+
   async list({ prefix, limit = 1000 }) {
     const keys = [...this.values.keys()]
       .filter((key) => key.startsWith(prefix))
@@ -116,6 +121,13 @@ function pollDraft(optionCount) {
 
 test('coordinates concurrent participant responses with strongly consistent storage', async () => {
   const coordinator = new PollCoordinator(new MemoryDurableState())
+  await coordinator.fetch(new Request('https://coordinator/poll', {
+    method: 'PUT',
+    body: JSON.stringify({
+      poll: { id: 'poll-one', status: 'open', options: [] },
+      legacyParticipants: [],
+    }),
+  }))
   const participants = [
     { id: 'participant-one', name: 'Ada', votes: {}, updatedAt: '2026-08-11T00:00:00.000Z' },
     { id: 'participant-two', name: 'Grace', votes: {}, updatedAt: '2026-08-11T00:00:01.000Z' },
@@ -166,6 +178,74 @@ test('creates an unlimited poll and stores concurrent responses separately', asy
   const getResponse = await call(environment, `/api/polls/${poll.id}`)
   const savedPoll = await getResponse.json()
   assert.deepEqual(savedPoll.participants.map((participant) => participant.name).sort(), ['Ada', 'Grace'])
+})
+
+test('protects poll management and supports the organizer lifecycle', async () => {
+  const environment = createEnvironment()
+  const created = await (await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).json()
+
+  assert.match(created.managementToken, /^[a-f0-9]{48}$/)
+  assert.equal(created.managementTokenHash, undefined)
+  const publicPoll = await (await call(environment, `/api/polls/${created.id}`)).json()
+  assert.equal(publicPoll.managementToken, undefined)
+  assert.equal(publicPoll.managementTokenHash, undefined)
+
+  const unauthorized = await call(environment, `/api/polls/${created.id}/manage`)
+  assert.equal(unauthorized.status, 403)
+
+  const managementHeaders = { 'X-Rally-Management-Token': created.managementToken }
+  const votes = { [created.options[0].id]: 'yes' }
+  await call(environment, `/api/polls/${created.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Grace', votes }),
+  })
+  const updateResponse = await call(environment, `/api/polls/${created.id}`, {
+    method: 'PATCH',
+    headers: managementHeaders,
+    body: JSON.stringify({
+      title: 'Updated planning session',
+      status: 'closed',
+      options: [
+        { ...created.options[0], date: '2026-08-20' },
+        { date: '2026-08-21', time: '09:30' },
+      ],
+    }),
+  })
+
+  assert.equal(updateResponse.status, 200)
+  const updated = await updateResponse.json()
+  assert.equal(updated.title, 'Updated planning session')
+  assert.equal(updated.status, 'closed')
+  assert.equal(updated.options.length, 2)
+  assert.equal(updated.participants[0].votes[updated.options[1].id], 'no')
+
+  const closedResponse = await call(environment, `/api/polls/${created.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Ada', votes }),
+  })
+  assert.equal(closedResponse.status, 409)
+
+  const reopened = await call(environment, `/api/polls/${created.id}`, {
+    method: 'PATCH',
+    headers: managementHeaders,
+    body: JSON.stringify({ status: 'open' }),
+  })
+  assert.equal(reopened.status, 200)
+
+  const managed = await call(environment, `/api/polls/${created.id}/manage`, {
+    headers: managementHeaders,
+  })
+  assert.equal(managed.status, 200)
+
+  const deleted = await call(environment, `/api/polls/${created.id}`, {
+    method: 'DELETE',
+    headers: managementHeaders,
+  })
+  assert.equal(deleted.status, 200)
+  assert.equal((await call(environment, `/api/polls/${created.id}`)).status, 404)
 })
 
 test('enforces a configured date limit', async () => {
@@ -415,10 +495,17 @@ test('rejects impossible calendar dates', async () => {
   assert.deepEqual(await response.json(), { error: 'Every option needs a valid date.' })
 })
 
-test('returns configuration and rejects unapproved browser origins', async () => {
+test('returns configuration, management CORS methods, and rejects unapproved origins', async () => {
   const environment = createEnvironment({ MAX_POLL_DATES: '20' })
   const configResponse = await call(environment, '/api/config')
   assert.deepEqual(await configResponse.json(), { maxDates: 20 })
+
+  const preflightResponse = await call(environment, '/api/polls/poll-one', { method: 'OPTIONS' })
+  assert.equal(preflightResponse.status, 204)
+  assert.equal(
+    preflightResponse.headers.get('Access-Control-Allow-Methods'),
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+  )
 
   const rejectedResponse = await worker.fetch(
     new Request('https://rally-api.example/api/health', {

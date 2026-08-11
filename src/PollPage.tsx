@@ -8,6 +8,7 @@ import {
   Copy,
   HelpCircle,
   LoaderCircle,
+  Lock,
   MapPin,
   RefreshCw,
   Trophy,
@@ -150,6 +151,10 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (poll?.status === 'closed') {
+      setError('This poll is closed.')
+      return
+    }
     if (!poll || !name.trim()) {
       setError('Enter your name before saving.')
       return
@@ -219,7 +224,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
     <main className="poll-page">
       <section className="poll-hero">
         <div className="poll-hero-main">
-          <span className="eyebrow">Group poll - Open</span>
+          <span className="eyebrow">Group poll - {poll.status}</span>
           <h1>{poll.title}</h1>
           <div className="poll-meta">
             <span><UserRound size={16} /> Hosted by {poll.organizer}</span>
@@ -245,6 +250,12 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
           </div>
 
           <form onSubmit={submit}>
+            {poll.status === 'closed' && (
+              <div className="closed-poll-notice" role="status">
+                <Lock size={18} />
+                <span>This poll is closed. Existing responses remain visible.</span>
+              </div>
+            )}
             <div className="response-name field-group">
               <label htmlFor="participant-name">Your name</label>
               <input
@@ -257,6 +268,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
                 placeholder="Enter your name"
                 maxLength={60}
                 required
+                disabled={poll.status === 'closed'}
               />
             </div>
 
@@ -289,6 +301,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
                               setError('')
                             }}
                             aria-pressed={votes[option.id] === choice.value}
+                            disabled={poll.status === 'closed'}
                           >
                             <Icon size={17} />
                             <span>{choice.label}</span>
@@ -308,8 +321,8 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
               <div className={`save-feedback${saved ? ' success' : ''}`} role="status">
                 {saved ? <><CheckCircle2 size={17} /> Availability saved</> : error}
               </div>
-              <button className="button button-primary button-large" type="submit" disabled={saving}>
-                {saving ? 'Saving...' : participantToken ? 'Update availability' : 'Save availability'}
+              <button className="button button-primary button-large" type="submit" disabled={saving || poll.status === 'closed'}>
+                {poll.status === 'closed' ? 'Poll closed' : saving ? 'Saving...' : participantToken ? 'Update availability' : 'Save availability'}
               </button>
             </div>
           </form>

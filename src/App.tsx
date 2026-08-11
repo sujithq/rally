@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
-import { CalendarCheck, Plus } from 'lucide-react'
+import { CalendarCheck, ClipboardList, Plus } from 'lucide-react'
 import { getConfig } from './api'
 import CreatePoll from './CreatePoll'
+import ManagePoll from './ManagePoll'
+import ManagePolls from './ManagePolls'
+import { rememberManagedPoll } from './managedPolls'
 import PollPage from './PollPage'
 
 function getRoute() {
@@ -11,6 +14,11 @@ function getRoute() {
 
 function getPollId(route: string) {
   return route.match(/^\/p\/([a-z0-9]+)\/?$/)?.[1]
+}
+
+function getManagementRoute(route: string) {
+  const match = route.match(/^\/manage\/([a-f0-9]{10})\/([a-f0-9]{48})\/?$/)
+  return match ? { pollId: match[1], managementToken: match[2] } : null
 }
 
 export default function App() {
@@ -43,6 +51,40 @@ export default function App() {
   }
 
   const pollId = getPollId(route)
+  const managementRoute = getManagementRoute(route)
+  const isManageIndex = /^\/manage\/?$/.test(route)
+
+  let content
+  if (managementRoute) {
+    content = maxDates === undefined ? (
+      <main className="status-page"><p>Loading date settings...</p></main>
+    ) : (
+      <ManagePoll
+        key={managementRoute.pollId}
+        pollId={managementRoute.pollId}
+        managementToken={managementRoute.managementToken}
+        maxDates={maxDates}
+        onNavigate={navigate}
+      />
+    )
+  } else if (isManageIndex) {
+    content = <ManagePolls onNavigate={navigate} />
+  } else if (pollId) {
+    content = <PollPage key={pollId} pollId={pollId} onCreateNew={() => navigate('/')} />
+  } else if (maxDates === undefined) {
+    content = <main className="status-page"><p>Loading date settings...</p></main>
+  } else {
+    content = (
+      <CreatePoll
+        maxDates={maxDates}
+        onCreated={(poll) => {
+          const reference = { id: poll.id, managementToken: poll.managementToken }
+          rememberManagedPoll(reference)
+          navigate(`/manage/${reference.id}/${reference.managementToken}`)
+        }}
+      />
+    )
+  }
 
   return (
     <div className="app-shell">
@@ -60,23 +102,22 @@ export default function App() {
               <span className="plan-dot" />
               {maxDates === undefined ? 'Loading settings' : maxDates === null ? 'No date limit' : `${maxDates} dates max`}
             </span>
-            {pollId && (
+            {!isManageIndex && !managementRoute && (
+              <button className="button button-small button-outline" type="button" onClick={() => navigate('/manage')}>
+                <ClipboardList size={16} />
+                <span className="header-action-label">My polls</span>
+              </button>
+            )}
+            {route !== '/' && (
               <button className="button button-small button-dark" type="button" onClick={() => navigate('/')}>
                 <Plus size={17} />
-                New poll
+                <span className="header-action-label">New poll</span>
               </button>
             )}
           </div>
         </div>
       </header>
-
-      {pollId ? (
-        <PollPage key={pollId} pollId={pollId} onCreateNew={() => navigate('/')} />
-      ) : maxDates === undefined ? (
-        <main className="status-page"><p>Loading date settings...</p></main>
-      ) : (
-        <CreatePoll maxDates={maxDates} onCreated={(id) => navigate(`/p/${id}`)} />
-      )}
+      {content}
     </div>
   )
 }

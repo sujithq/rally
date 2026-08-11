@@ -111,3 +111,57 @@ test('keeps edit tokens private and enforces the configured response limit', asy
     ['Ada Updated', 'Mallory'],
   )
 })
+
+test('protects poll management and supports edits, closing, and deletion', async () => {
+  const created = await (await request('/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft('2026-09-01')),
+  })).json()
+  assert.match(created.managementToken, /^[a-f0-9]{48}$/)
+  assert.equal(created.managementTokenHash, undefined)
+
+  const unauthorized = await request(`/api/polls/${created.id}/manage`)
+  assert.equal(unauthorized.status, 403)
+  const headers = { 'X-Rally-Management-Token': created.managementToken }
+  const votes = { [created.options[0].id]: 'yes' }
+  await request(`/api/polls/${created.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Grace', votes }),
+  })
+
+  const updateResponse = await request(`/api/polls/${created.id}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({
+      title: 'Managed planning session',
+      status: 'closed',
+      options: [
+        created.options[0],
+        { date: '2026-09-02', time: '10:00' },
+      ],
+    }),
+  })
+  assert.equal(updateResponse.status, 200)
+  const updated = await updateResponse.json()
+  assert.equal(updated.title, 'Managed planning session')
+  assert.equal(updated.status, 'closed')
+  assert.equal(updated.participants[0].votes[updated.options[1].id], 'no')
+
+  const closedResponse = await request(`/api/polls/${created.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Ada', votes }),
+  })
+  assert.equal(closedResponse.status, 409)
+
+  const reopened = await request(`/api/polls/${created.id}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ status: 'open' }),
+  })
+  assert.equal(reopened.status, 200)
+  assert.equal((await request(`/api/polls/${created.id}/manage`, { headers })).status, 200)
+
+  const deleted = await request(`/api/polls/${created.id}`, { method: 'DELETE', headers })
+  assert.equal(deleted.status, 200)
+  assert.equal((await request(`/api/polls/${created.id}`)).status, 404)
+})

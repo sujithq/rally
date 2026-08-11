@@ -28,6 +28,11 @@ function latestParticipants(participants) {
   return [...byId.values()]
 }
 
+function publicPoll(poll) {
+  const { managementTokenHash: _managementTokenHash, participants: _participants, ...result } = poll
+  return result
+}
+
 export class PollCoordinator {
   constructor(state) {
     this.state = state
@@ -39,22 +44,53 @@ export class PollCoordinator {
   }
 
   async mergeLegacyParticipants(participants) {
-    const entries = Object.fromEntries(
-      participants
-        .filter((participant) => participant?.id)
-        .map((participant) => [`participant:legacy:${participant.id}`, participant]),
-    )
+    const entries = {}
+    for (const participant of participants.filter((item) => item?.id)) {
+      const key = `participant:legacy:${participant.id}`
+      const existing = await this.state.storage.get(key)
+      if (!existing || participant.updatedAt > existing.updatedAt) entries[key] = participant
+    }
     if (Object.keys(entries).length) await this.state.storage.put(entries)
+  }
+
+  async normalizeParticipants(optionIds) {
+    const entries = await this.state.storage.list({ prefix: 'participant:' })
+    const updates = Object.fromEntries([...entries].map(([key, participant]) => [key, {
+      ...participant,
+      votes: Object.fromEntries(optionIds.map((optionId) => [
+        optionId,
+        voteValues.includes(participant.votes?.[optionId]) ? participant.votes[optionId] : 'no',
+      ])),
+    }]))
+    if (Object.keys(updates).length) await this.state.storage.put(updates)
   }
 
   async handle(request) {
     const url = new URL(request.url)
     const body = await request.json()
+    if (await this.state.storage.get('poll:deleted')) {
+      throw new RequestError('Poll not found.', 404)
+    }
+
+    if (request.method === 'DELETE' && url.pathname === '/poll') {
+      const participantEntries = await this.state.storage.list({ prefix: 'participant:' })
+      for (const key of participantEntries.keys()) await this.state.storage.delete(key)
+      await this.state.storage.delete('poll:details')
+      await this.state.storage.put('poll:deleted', true)
+      return coordinatorJson({ deleted: true })
+    }
+
     await this.mergeLegacyParticipants(Array.isArray(body.legacyParticipants)
       ? body.legacyParticipants
       : [])
+    let poll = await this.state.storage.get('poll:details')
+    if (!poll && body.legacyPoll?.id) {
+      poll = body.legacyPoll
+      await this.state.storage.put('poll:details', poll)
+    }
 
     if (request.method === 'POST' && url.pathname === '/hydrate') {
+      if (!poll) throw new RequestError('Poll not found.', 404)
       if (body.viewerParticipant && body.viewerTokenHash) {
         await this.state.storage.put(
           `participant:token:${body.viewerTokenHash}`,
@@ -65,12 +101,26 @@ export class PollCoordinator {
         ? await this.state.storage.get(`participant:token:${body.viewerTokenHash}`)
         : null
       return coordinatorJson({
+        ...publicPoll(poll),
         participants: await this.participants(),
         ...(viewerParticipant ? { viewerParticipantId: viewerParticipant.id } : {}),
       })
     }
 
+    if (request.method === 'PUT' && url.pathname === '/poll') {
+      if (!body.poll?.id) throw new RequestError('Invalid poll.')
+      poll = body.poll
+      await this.state.storage.put('poll:details', poll)
+      await this.normalizeParticipants(poll.options.map(({ id }) => id))
+      return coordinatorJson({
+        ...publicPoll(poll),
+        participants: await this.participants(),
+      })
+    }
+
     if (request.method === 'PUT' && url.pathname === '/responses') {
+      if (!poll) throw new RequestError('Poll not found.', 404)
+      if (poll.status === 'closed') throw new RequestError('This poll is closed.', 409)
       const participant = body.participant
       const tokenHash = body.participantTokenHash
       const maxResponses = body.maxResponses
@@ -257,8 +307,8 @@ function allowedOrigin(request, env) {
 function responseHeaders(request, env) {
   const origin = allowedOrigin(request, env)
   return {
-    'Access-Control-Allow-Headers': 'Content-Type, X-Rally-Participant-Token',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Rally-Participant-Token, X-Rally-Management-Token',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Cache-Control': 'no-store',
     'Content-Type': 'application/json; charset=utf-8',
     Vary: 'Origin',
@@ -337,7 +387,7 @@ function buildHydratedPoll(poll, participants, savedParticipant, viewerParticipa
     else participants.push(savedParticipant)
   }
   return {
-    ...poll,
+    ...publicPoll(poll),
     participants,
     ...(viewerParticipantId ? { viewerParticipantId } : {}),
   }
@@ -346,12 +396,41 @@ function buildHydratedPoll(poll, participants, savedParticipant, viewerParticipa
 async function hydratePoll(env, poll, savedParticipant, viewerTokenHash, maxResponses) {
   const { participants } = await readParticipants(env, poll, maxResponses)
   const coordinatedPoll = await callPollCoordinator(env, poll.id, '/hydrate', 'POST', {
+    legacyPoll: poll,
     legacyParticipants: participants,
     viewerParticipant: savedParticipant,
     viewerTokenHash,
   })
-  if (coordinatedPoll) return { ...poll, ...coordinatedPoll }
+  if (coordinatedPoll) return coordinatedPoll
   return buildHydratedPoll(poll, participants, savedParticipant, savedParticipant?.id)
+}
+
+async function authorizeManagement(request, poll) {
+  const managementToken = cleanText(request.headers.get('X-Rally-Management-Token'), 64)
+  const authorized = /^[a-f0-9]{48}$/.test(managementToken)
+    && typeof poll.managementTokenHash === 'string'
+    && await hashParticipantToken(managementToken) === poll.managementTokenHash
+  if (!authorized) throw new RequestError('Organizer access required.', 403)
+}
+
+function updatedOptions(options, currentPoll, maxDates) {
+  const optionsError = validateOptions(options, maxDates)
+  if (optionsError) throw new RequestError(optionsError)
+
+  const existingIds = new Set(currentPoll.options.map(({ id }) => id))
+  const usedIds = new Set()
+  return options.map((option) => {
+    const requestedId = cleanText(option?.id, 20)
+    const id = existingIds.has(requestedId) && !usedIds.has(requestedId)
+      ? requestedId
+      : createId()
+    usedIds.add(id)
+    return {
+      id,
+      date: cleanText(option.date, 10),
+      time: cleanText(option.time, 5),
+    }
+  })
 }
 
 async function createPoll(request, env) {
@@ -379,8 +458,16 @@ async function createPoll(request, env) {
     })),
   }
 
+  const managementToken = createParticipantToken()
+  poll.managementTokenHash = await hashParticipantToken(managementToken)
+
   await env.POLLS.put(pollKey(poll.id), JSON.stringify(poll))
-  return json(request, env, { ...poll, participants: [] }, 201)
+  await callPollCoordinator(env, poll.id, '/poll', 'PUT', { poll, legacyParticipants: [] })
+  return json(request, env, {
+    ...publicPoll(poll),
+    participants: [],
+    managementToken,
+  }, 201)
 }
 
 async function getPoll(request, env, pollId, maxResponses) {
@@ -404,8 +491,8 @@ async function getPoll(request, env, pollId, maxResponses) {
 }
 
 async function saveResponse(request, env, pollId, maxResponses) {
-  const poll = await readPoll(env, pollId)
-  if (!poll) throw new RequestError('Poll not found.', 404)
+  const storedPoll = await readPoll(env, pollId)
+  if (!storedPoll) throw new RequestError('Poll not found.', 404)
 
   const body = await readJson(request)
   const name = cleanText(body.name, 60)
@@ -421,6 +508,14 @@ async function saveResponse(request, env, pollId, maxResponses) {
   const existingParticipant = hasRequestedParticipantToken
     ? await env.POLLS.get(participantResponseKey, 'json')
     : null
+  const poll = await hydratePoll(
+    env,
+    storedPoll,
+    existingParticipant,
+    hasRequestedParticipantToken ? participantTokenHash : null,
+    maxResponses,
+  )
+  if (poll.status === 'closed') throw new RequestError('This poll is closed.', 409)
   const votes = Object.fromEntries(
     poll.options.map((option) => {
       const vote = body.votes?.[option.id]
@@ -436,6 +531,7 @@ async function saveResponse(request, env, pollId, maxResponses) {
 
   const { participants, responseCount } = await readParticipants(env, poll, maxResponses)
   const coordinatedPoll = await callPollCoordinator(env, pollId, '/responses', 'PUT', {
+    legacyPoll: storedPoll,
     legacyParticipants: participants,
     participant,
     participantTokenHash,
@@ -452,10 +548,81 @@ async function saveResponse(request, env, pollId, maxResponses) {
   )
   return json(request, env, {
     poll: coordinatedPoll
-      ? { ...poll, ...coordinatedPoll }
+      ? { ...publicPoll(poll), ...coordinatedPoll }
       : buildHydratedPoll(poll, participants, participant, participant.id),
     participantId: participantToken,
   })
+}
+
+async function getManagedPoll(request, env, pollId, maxResponses) {
+  const poll = await readPoll(env, pollId)
+  if (!poll) throw new RequestError('Poll not found.', 404)
+  await authorizeManagement(request, poll)
+  return json(request, env, await hydratePoll(env, poll, null, null, maxResponses))
+}
+
+async function updatePoll(request, env, pollId, maxDates, maxResponses) {
+  const storedPoll = await readPoll(env, pollId)
+  if (!storedPoll) throw new RequestError('Poll not found.', 404)
+  await authorizeManagement(request, storedPoll)
+  const currentPoll = await hydratePoll(env, storedPoll, null, null, maxResponses)
+  const body = await readJson(request)
+  const title = body.title === undefined ? currentPoll.title : cleanText(body.title, 100)
+  const organizer = body.organizer === undefined
+    ? currentPoll.organizer
+    : cleanText(body.organizer, 60)
+  if (!title || !organizer) {
+    throw new RequestError('A title and organizer name are required.')
+  }
+  if (body.status !== undefined && !['open', 'closed'].includes(body.status)) {
+    throw new RequestError('Poll status must be open or closed.')
+  }
+
+  const poll = {
+    ...storedPoll,
+    title,
+    organizer,
+    description: body.description === undefined
+      ? currentPoll.description
+      : cleanText(body.description, 500),
+    location: body.location === undefined
+      ? currentPoll.location
+      : cleanText(body.location, 120),
+    status: body.status ?? currentPoll.status,
+    options: body.options === undefined
+      ? currentPoll.options
+      : updatedOptions(body.options, currentPoll, maxDates),
+  }
+  const coordinatedPoll = await callPollCoordinator(env, pollId, '/poll', 'PUT', {
+    poll,
+    legacyParticipants: currentPoll.participants,
+  })
+  await env.POLLS.put(pollKey(pollId), JSON.stringify(poll))
+
+  if (coordinatedPoll) return json(request, env, coordinatedPoll)
+  const optionIds = new Set(poll.options.map(({ id }) => id))
+  const participants = currentPoll.participants.map((participant) => ({
+    ...participant,
+    votes: Object.fromEntries([...optionIds].map((optionId) => [
+      optionId,
+      voteValues.includes(participant.votes[optionId]) ? participant.votes[optionId] : 'no',
+    ])),
+  }))
+  return json(request, env, { ...publicPoll(poll), participants })
+}
+
+async function deletePoll(request, env, pollId, maxResponses) {
+  const poll = await readPoll(env, pollId)
+  if (!poll) throw new RequestError('Poll not found.', 404)
+  await authorizeManagement(request, poll)
+  await callPollCoordinator(env, pollId, '/poll', 'DELETE', {})
+  const responsePage = await env.POLLS.list({
+    prefix: responsePrefix(pollId),
+    limit: maxResponses,
+  })
+  await Promise.all(responsePage.keys.map(({ name }) => env.POLLS.delete(name)))
+  await env.POLLS.delete(pollKey(pollId))
+  return json(request, env, { deleted: true })
 }
 
 async function route(request, env) {
@@ -476,6 +643,17 @@ async function route(request, env) {
   const pollMatch = url.pathname.match(/^\/api\/polls\/([a-f0-9]{10})$/)
   if (request.method === 'GET' && pollMatch) {
     return getPoll(request, env, pollMatch[1], maxResponses)
+  }
+  if (request.method === 'PATCH' && pollMatch) {
+    return updatePoll(request, env, pollMatch[1], maxDates, maxResponses)
+  }
+  if (request.method === 'DELETE' && pollMatch) {
+    return deletePoll(request, env, pollMatch[1], maxResponses)
+  }
+
+  const manageMatch = url.pathname.match(/^\/api\/polls\/([a-f0-9]{10})\/manage$/)
+  if (request.method === 'GET' && manageMatch) {
+    return getManagedPoll(request, env, manageMatch[1], maxResponses)
   }
 
   const responseMatch = url.pathname.match(/^\/api\/polls\/([a-f0-9]{10})\/responses$/)

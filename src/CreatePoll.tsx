@@ -3,10 +3,11 @@ import { ArrowRight, CalendarDays, Clock3, MapPin, Trash2 } from 'lucide-react'
 import { createPoll } from './api'
 import CalendarPicker from './CalendarPicker'
 import { formatDate } from './date'
+import type { CreatedPoll } from './types'
 
 interface CreatePollProps {
   maxDates: number | null
-  onCreated: (pollId: string) => void
+  onCreated: (poll: CreatedPoll) => void
 }
 
 export default function CreatePoll({ maxDates, onCreated }: CreatePollProps) {
@@ -55,8 +56,10 @@ export default function CreatePoll({ maxDates, onCreated }: CreatePollProps) {
         location,
         options: selectedDates.map((date) => ({ date, time: times[date] || '' })),
       })
-      localStorage.setItem('rally-organizer', organizer.trim())
-      onCreated(poll.id)
+      try {
+        localStorage.setItem('rally-organizer', organizer.trim())
+      } catch {}
+      onCreated(poll)
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not create the poll.')
     } finally {

@@ -30,6 +30,12 @@ Optional repository variables:
 
 Shared poll URLs use hash routing, such as `https://quintelier.dev/doodle2/#/p/abc123`, so opening or refreshing a poll works on GitHub Pages.
 
+## Managing polls
+
+Creating a poll opens its private organizer page and adds it to **My polls** in that browser. Organizers can edit details and date options, close or reopen responses, copy the public invite, and permanently delete the poll.
+
+The management link contains a private organizer token in its URL hash. Anyone with that link can manage the poll, so keep a copy and share it only with trusted co-organizers. Rally does not have accounts or a token-recovery flow; clearing browser storage removes the poll from **My polls**, but a saved management link restores access. Polls created before organizer tokens were introduced cannot be managed.
+
 ## Persistence model
 
 Workers KV stores poll definitions and a separate backup record for each participant response. A per-poll Durable Object is the strongly consistent response coordinator, so participants in different browser sessions see each other's updates without relying on eventually consistent KV key listings. Existing KV response records are merged into the coordinator as they become visible, preserving responses created before the Durable Object migration.

@@ -37,6 +37,24 @@ export interface PollDraft {
   options: PollOptionInput[]
 }
 
+export interface CreatedPoll extends Poll {
+  managementToken: string
+}
+
+export interface PollUpdate {
+  title?: string
+  organizer?: string
+  description?: string
+  location?: string
+  status?: Poll['status']
+  options?: Array<PollOptionInput & { id?: string }>
+}
+
+export interface ManagedPollReference {
+  id: string
+  managementToken: string
+}
+
 export interface SavedResponse {
   poll: Poll
   participantId: string
