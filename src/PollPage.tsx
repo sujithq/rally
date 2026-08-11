@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
   CalendarDays,
@@ -66,40 +66,87 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
   const [copied, setCopied] = useState(false)
+  const requestVersion = useRef(0)
+  const refreshInFlight = useRef(false)
+  const savingInFlight = useRef(false)
 
-  const load = async (quiet = false) => {
-    if (quiet) setRefreshing(true)
-    else {
-      setLoading(true)
-      setPoll(null)
-      setParticipantToken('')
-      setName('')
-      setVotes({})
+  const refreshPoll = async (manual = false) => {
+    if (refreshInFlight.current || savingInFlight.current) return
+    refreshInFlight.current = true
+    const currentRequest = ++requestVersion.current
+    if (manual) {
+      setRefreshing(true)
+      setError('')
     }
-    setError('')
     try {
       const storedToken = localStorage.getItem(storageKey) || ''
       const nextPoll = await getPoll(pollId, storedToken)
-      setPoll(nextPoll)
-      const existingResponse = nextPoll.participants.find(
-        (participant) => participant.id === nextPoll.viewerParticipantId,
-      )
-      if (existingResponse) {
-        setParticipantToken(storedToken)
-        setName(existingResponse.name)
-        setVotes(existingResponse.votes)
-      }
+      if (currentRequest === requestVersion.current) setPoll(nextPoll)
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not load this poll.')
+      if (manual && currentRequest === requestVersion.current) {
+        setError(requestError instanceof Error ? requestError.message : 'Could not refresh this poll.')
+      }
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      refreshInFlight.current = false
+      if (manual) setRefreshing(false)
     }
   }
 
   useEffect(() => {
-    void load()
+    let active = true
+    const currentRequest = ++requestVersion.current
+    setLoading(true)
+    setPoll(null)
+    setParticipantToken('')
+    setName('')
+    setVotes({})
+    setError('')
+
+    const loadPoll = async () => {
+      try {
+        const storedToken = localStorage.getItem(storageKey) || ''
+        const nextPoll = await getPoll(pollId, storedToken)
+        if (!active || currentRequest !== requestVersion.current) return
+        setPoll(nextPoll)
+        const existingResponse = nextPoll.participants.find(
+          (participant) => participant.id === nextPoll.viewerParticipantId,
+        )
+        if (existingResponse) {
+          setParticipantToken(storedToken)
+          setName(existingResponse.name)
+          setVotes(existingResponse.votes)
+        }
+      } catch (requestError) {
+        if (active && currentRequest === requestVersion.current) {
+          setError(requestError instanceof Error ? requestError.message : 'Could not load this poll.')
+        }
+      } finally {
+        if (active && currentRequest === requestVersion.current) setLoading(false)
+      }
+    }
+
+    void loadPoll()
+    return () => {
+      active = false
+      requestVersion.current += 1
+    }
   }, [pollId])
+
+  useEffect(() => {
+    if (loading || !poll) return
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void refreshPoll()
+    }
+    const interval = window.setInterval(refreshWhenVisible, 5000)
+    window.addEventListener('focus', refreshWhenVisible)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', refreshWhenVisible)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+    }
+  }, [loading, pollId])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -112,11 +159,14 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
       return
     }
 
+    savingInFlight.current = true
+    const currentRequest = ++requestVersion.current
     setSaving(true)
     setSaved(false)
     setError('')
     try {
       const result = await saveResponse(pollId, { participantId: participantToken, name, votes })
+      if (currentRequest !== requestVersion.current) return
       setPoll(result.poll)
       setParticipantToken(result.participantId)
       localStorage.setItem(storageKey, result.participantId)
@@ -124,6 +174,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not save your response.')
     } finally {
+      savingInFlight.current = false
       setSaving(false)
     }
   }
@@ -273,7 +324,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
             <button
               className="icon-button"
               type="button"
-              onClick={() => void load(true)}
+              onClick={() => void refreshPoll(true)}
               disabled={refreshing}
               aria-label="Refresh results"
               title="Refresh results"

@@ -9,6 +9,20 @@
       "id": "00000000000000000000000000000000"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "POLL_COORDINATORS",
+        "class_name": "PollCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PollCoordinator"]
+    }
+  ],
   "vars": {
     "MAX_POLL_DATES": "unlimited",
     "MAX_POLL_RESPONSES": "100",

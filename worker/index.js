@@ -9,6 +9,108 @@ class RequestError extends Error {
   }
 }
 
+function coordinatorJson(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  })
+}
+
+function latestParticipants(participants) {
+  const byId = new Map()
+  for (const participant of participants) {
+    if (!participant?.id) continue
+    const existing = byId.get(participant.id)
+    if (!existing || participant.updatedAt >= existing.updatedAt) {
+      byId.set(participant.id, participant)
+    }
+  }
+  return [...byId.values()]
+}
+
+export class PollCoordinator {
+  constructor(state) {
+    this.state = state
+  }
+
+  async participants() {
+    const entries = await this.state.storage.list({ prefix: 'participant:' })
+    return latestParticipants([...entries.values()])
+  }
+
+  async mergeLegacyParticipants(participants) {
+    const entries = Object.fromEntries(
+      participants
+        .filter((participant) => participant?.id)
+        .map((participant) => [`participant:legacy:${participant.id}`, participant]),
+    )
+    if (Object.keys(entries).length) await this.state.storage.put(entries)
+  }
+
+  async handle(request) {
+    const url = new URL(request.url)
+    const body = await request.json()
+    await this.mergeLegacyParticipants(Array.isArray(body.legacyParticipants)
+      ? body.legacyParticipants
+      : [])
+
+    if (request.method === 'POST' && url.pathname === '/hydrate') {
+      if (body.viewerParticipant && body.viewerTokenHash) {
+        await this.state.storage.put(
+          `participant:token:${body.viewerTokenHash}`,
+          body.viewerParticipant,
+        )
+      }
+      const viewerParticipant = body.viewerTokenHash
+        ? await this.state.storage.get(`participant:token:${body.viewerTokenHash}`)
+        : null
+      return coordinatorJson({
+        participants: await this.participants(),
+        ...(viewerParticipant ? { viewerParticipantId: viewerParticipant.id } : {}),
+      })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/responses') {
+      const participant = body.participant
+      const tokenHash = body.participantTokenHash
+      const maxResponses = body.maxResponses
+      if (!participant?.id || !/^[a-f0-9]{64}$/.test(tokenHash)) {
+        throw new RequestError('Invalid participant response.')
+      }
+
+      const responseKeyName = `participant:token:${tokenHash}`
+      const existingParticipant = await this.state.storage.get(responseKeyName)
+      const participants = await this.participants()
+      const participantExists = participants.some(({ id }) => id === participant.id)
+      if (!existingParticipant && !participantExists && participants.length >= maxResponses) {
+        throw new RequestError('This poll has reached its response limit.', 409)
+      }
+
+      await this.state.storage.put(responseKeyName, participant)
+      await this.state.storage.delete(`participant:legacy:${participant.id}`)
+      return coordinatorJson({
+        participants: await this.participants(),
+        viewerParticipantId: participant.id,
+      })
+    }
+
+    throw new RequestError('Not found.', 404)
+  }
+
+  async fetch(request) {
+    return this.state.blockConcurrencyWhile(async () => {
+      try {
+        return await this.handle(request)
+      } catch (error) {
+        if (error instanceof RequestError) {
+          return coordinatorJson({ error: error.message }, error.status)
+        }
+        throw error
+      }
+    })
+  }
+}
+
 function cleanText(value, maxLength) {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : ''
 }
@@ -210,6 +312,24 @@ async function readParticipants(env, poll, maxResponses) {
   return { participants, responseCount: scannedKeys }
 }
 
+function pollCoordinator(env, pollId) {
+  if (!env.POLL_COORDINATORS) return null
+  const objectId = env.POLL_COORDINATORS.idFromName(pollId)
+  return env.POLL_COORDINATORS.get(objectId)
+}
+
+async function callPollCoordinator(env, pollId, path, method, payload) {
+  const coordinator = pollCoordinator(env, pollId)
+  if (!coordinator) return null
+  const response = await coordinator.fetch(new Request(`https://poll-coordinator${path}`, {
+    method,
+    body: JSON.stringify(payload),
+  }))
+  const result = await response.json()
+  if (!response.ok) throw new RequestError(result.error || 'Could not update this poll.', response.status)
+  return result
+}
+
 function buildHydratedPoll(poll, participants, savedParticipant, viewerParticipantId) {
   if (savedParticipant) {
     const existingIndex = participants.findIndex((participant) => participant.id === savedParticipant.id)
@@ -223,9 +343,15 @@ function buildHydratedPoll(poll, participants, savedParticipant, viewerParticipa
   }
 }
 
-async function hydratePoll(env, poll, savedParticipant, viewerParticipantId, maxResponses) {
+async function hydratePoll(env, poll, savedParticipant, viewerTokenHash, maxResponses) {
   const { participants } = await readParticipants(env, poll, maxResponses)
-  return buildHydratedPoll(poll, participants, savedParticipant, viewerParticipantId)
+  const coordinatedPoll = await callPollCoordinator(env, poll.id, '/hydrate', 'POST', {
+    legacyParticipants: participants,
+    viewerParticipant: savedParticipant,
+    viewerTokenHash,
+  })
+  if (coordinatedPoll) return { ...poll, ...coordinatedPoll }
+  return buildHydratedPoll(poll, participants, savedParticipant, savedParticipant?.id)
 }
 
 async function createPoll(request, env) {
@@ -261,14 +387,18 @@ async function getPoll(request, env, pollId, maxResponses) {
   const poll = await readPoll(env, pollId)
   if (!poll) throw new RequestError('Poll not found.', 404)
   const participantToken = cleanText(request.headers.get('X-Rally-Participant-Token'), 64)
-  const viewerParticipant = /^[a-f0-9]{48}$/.test(participantToken)
-    ? await env.POLLS.get(await responseKey(pollId, participantToken), 'json')
+  const hasParticipantToken = /^[a-f0-9]{48}$/.test(participantToken)
+  const viewerTokenHash = hasParticipantToken
+    ? await hashParticipantToken(participantToken)
+    : null
+  const viewerParticipant = viewerTokenHash
+    ? await env.POLLS.get(`${responsePrefix(pollId)}${viewerTokenHash}`, 'json')
     : null
   return json(request, env, await hydratePoll(
     env,
     poll,
     viewerParticipant,
-    viewerParticipant?.id,
+    viewerTokenHash,
     maxResponses,
   ))
 }
@@ -305,7 +435,13 @@ async function saveResponse(request, env, pollId, maxResponses) {
   }
 
   const { participants, responseCount } = await readParticipants(env, poll, maxResponses)
-  if (!existingParticipant && responseCount >= maxResponses) {
+  const coordinatedPoll = await callPollCoordinator(env, pollId, '/responses', 'PUT', {
+    legacyParticipants: participants,
+    participant,
+    participantTokenHash,
+    maxResponses,
+  })
+  if (!coordinatedPoll && !existingParticipant && responseCount >= maxResponses) {
     throw new RequestError('This poll has reached its response limit.', 409)
   }
 
@@ -315,7 +451,9 @@ async function saveResponse(request, env, pollId, maxResponses) {
     { metadata: participantMetadata(poll, participant) },
   )
   return json(request, env, {
-    poll: buildHydratedPoll(poll, participants, participant, participant.id),
+    poll: coordinatedPoll
+      ? { ...poll, ...coordinatedPoll }
+      : buildHydratedPoll(poll, participants, participant, participant.id),
     participantId: participantToken,
   })
 }

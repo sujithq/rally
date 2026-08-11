@@ -1,6 +1,62 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import worker from './index.js'
+import worker, { PollCoordinator } from './index.js'
+
+class MemoryDurableStorage {
+  values = new Map()
+
+  async get(key) {
+    return this.values.get(key)
+  }
+
+  async put(key, value) {
+    if (typeof key === 'string') {
+      this.values.set(key, value)
+      return
+    }
+    for (const [entryKey, entryValue] of Object.entries(key)) {
+      this.values.set(entryKey, entryValue)
+    }
+  }
+
+  async delete(key) {
+    return this.values.delete(key)
+  }
+
+  async list({ prefix }) {
+    return new Map([...this.values]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort(([left], [right]) => left.localeCompare(right)))
+  }
+}
+
+class MemoryDurableState {
+  storage = new MemoryDurableStorage()
+  tail = Promise.resolve()
+
+  blockConcurrencyWhile(callback) {
+    const result = this.tail.then(callback, callback)
+    this.tail = result.catch(() => undefined)
+    return result
+  }
+}
+
+class MemoryDurableNamespace {
+  coordinators = new Map()
+
+  idFromName(name) {
+    return name
+  }
+
+  get(id) {
+    if (!this.coordinators.has(id)) {
+      this.coordinators.set(id, new PollCoordinator(new MemoryDurableState()))
+    }
+    return {
+      fetch: (request) => this.coordinators.get(id).fetch(request),
+    }
+  }
+}
 
 class MemoryKv {
   values = new Map()
@@ -30,16 +86,17 @@ class MemoryKv {
 function createEnvironment(overrides = {}) {
   return {
     POLLS: new MemoryKv(),
+    POLL_COORDINATORS: new MemoryDurableNamespace(),
     MAX_POLL_DATES: 'unlimited',
     MAX_POLL_RESPONSES: '100',
-    ALLOWED_ORIGINS: 'https://sujithq.github.io',
+    ALLOWED_ORIGINS: 'https://quintelier.dev',
     ...overrides,
   }
 }
 
 function call(environment, path, options = {}) {
   const headers = new Headers(options.headers)
-  headers.set('Origin', 'https://sujithq.github.io')
+  headers.set('Origin', 'https://quintelier.dev')
   if (options.body) headers.set('Content-Type', 'application/json')
   return worker.fetch(new Request(`https://rally-api.example${path}`, { ...options, headers }), environment)
 }
@@ -56,6 +113,36 @@ function pollDraft(optionCount) {
     })),
   }
 }
+
+test('coordinates concurrent participant responses with strongly consistent storage', async () => {
+  const coordinator = new PollCoordinator(new MemoryDurableState())
+  const participants = [
+    { id: 'participant-one', name: 'Ada', votes: {}, updatedAt: '2026-08-11T00:00:00.000Z' },
+    { id: 'participant-two', name: 'Grace', votes: {}, updatedAt: '2026-08-11T00:00:01.000Z' },
+  ]
+
+  const responses = await Promise.all(participants.map((participant, index) => coordinator.fetch(
+    new Request('https://coordinator/responses', {
+      method: 'PUT',
+      body: JSON.stringify({
+        legacyParticipants: [],
+        participant,
+        participantTokenHash: String(index + 1).repeat(64),
+        maxResponses: 100,
+      }),
+    }),
+  )))
+
+  assert.deepEqual(responses.map(({ status }) => status), [200, 200])
+  const hydrated = await coordinator.fetch(new Request('https://coordinator/hydrate', {
+    method: 'POST',
+    body: JSON.stringify({ legacyParticipants: [] }),
+  }))
+  assert.deepEqual(
+    (await hydrated.json()).participants.map(({ name }) => name).sort(),
+    ['Ada', 'Grace'],
+  )
+})
 
 test('creates an unlimited poll and stores concurrent responses separately', async () => {
   const environment = createEnvironment()
@@ -157,6 +244,44 @@ test('includes the current response while KV key listings are stale', async () =
 
   assert.equal(authenticatedPoll.viewerParticipantId, saved.poll.viewerParticipantId)
   assert.deepEqual(authenticatedPoll.participants.map((participant) => participant.name), ['Ada'])
+})
+
+test('shares updates across sessions while KV key listings are stale', async () => {
+  const environment = createEnvironment()
+  const createResponse = await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })
+  const poll = await createResponse.json()
+  environment.POLLS.list = async () => ({ keys: [], list_complete: true })
+  const votes = { [poll.options[0].id]: 'yes' }
+
+  const firstSaved = await (await call(environment, `/api/polls/${poll.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Ada', votes }),
+  })).json()
+  const secondSaved = await (await call(environment, `/api/polls/${poll.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: 'Grace', votes }),
+  })).json()
+
+  const firstView = await (await call(environment, `/api/polls/${poll.id}`, {
+    headers: { 'X-Rally-Participant-Token': firstSaved.participantId },
+  })).json()
+  assert.deepEqual(firstView.participants.map(({ name }) => name).sort(), ['Ada', 'Grace'])
+
+  await call(environment, `/api/polls/${poll.id}/responses`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      participantId: firstSaved.participantId,
+      name: 'Ada Updated',
+      votes,
+    }),
+  })
+  const secondView = await (await call(environment, `/api/polls/${poll.id}`, {
+    headers: { 'X-Rally-Participant-Token': secondSaved.participantId },
+  })).json()
+  assert.deepEqual(secondView.participants.map(({ name }) => name).sort(), ['Ada Updated', 'Grace'])
 })
 
 test('reuses an edit token when its KV value is temporarily stale', async () => {
