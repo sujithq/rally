@@ -57,7 +57,7 @@ jobs:
           }
           NODE
 
-      - name: Verify Cloudflare Worker access
+      - name: Verify Cloudflare Worker setup
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -83,6 +83,29 @@ jobs:
           if (!response.ok && response.status !== 404) {
             const details = errors.map((error) => `${error.code}: ${error.message}`).join('; ')
             throw new Error(`Cloudflare Worker access check failed${details ? `: ${details}` : '.'}`)
+          }
+
+          const subdomainResponse = await fetch(new URL(
+            `/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/subdomain`,
+            'https://api.cloudflare.com',
+          ), {
+            headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+          })
+          const subdomainPayload = await subdomainResponse.json()
+          const subdomainErrors = Array.isArray(subdomainPayload.errors)
+            ? subdomainPayload.errors
+            : []
+          if (subdomainErrors.some((error) => error.code === 10007)) {
+            throw new Error(
+              'Register an account workers.dev subdomain in Cloudflare Workers & Pages before deploying: '
+              + 'https://dash.cloudflare.com/?to=/:account/workers-and-pages',
+            )
+          }
+          if (!subdomainResponse.ok) {
+            const details = subdomainErrors
+              .map((error) => `${error.code}: ${error.message}`)
+              .join('; ')
+            throw new Error(`Cloudflare subdomain check failed${details ? `: ${details}` : '.'}`)
           }
           NODE
 
