@@ -28,7 +28,7 @@ Optional repository variables:
 - `MAX_POLL_RESPONSES`: a positive integer; defaults to 100 to bound API work and response size.
 - `ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API. It defaults to the repository owner's `github.io` origin during deployment.
 
-Shared poll URLs use hash routing, such as `https://quintelier.dev/doodle2/#/p/abc123`, so opening or refreshing a poll works on GitHub Pages.
+Shared poll URLs use hash routing, such as `https://quintelier.dev/rally/#/p/abc123`, so opening or refreshing a poll works on GitHub Pages.
 
 ## Managing polls
 
