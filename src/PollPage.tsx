@@ -57,7 +57,7 @@ function VoteIcon({ vote }: { vote: Vote }) {
 export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
   const storageKey = `rally-participant-${pollId}`
   const [poll, setPoll] = useState<Poll | null>(null)
-  const [participantId, setParticipantId] = useState(() => localStorage.getItem(storageKey) || '')
+  const [participantToken, setParticipantToken] = useState(() => localStorage.getItem(storageKey) || '')
   const [name, setName] = useState('')
   const [votes, setVotes] = useState<Record<string, Vote>>({})
   const [loading, setLoading] = useState(true)
@@ -69,15 +69,23 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
 
   const load = async (quiet = false) => {
     if (quiet) setRefreshing(true)
-    else setLoading(true)
+    else {
+      setLoading(true)
+      setPoll(null)
+      setParticipantToken('')
+      setName('')
+      setVotes({})
+    }
     setError('')
     try {
-      const nextPoll = await getPoll(pollId)
+      const storedToken = localStorage.getItem(storageKey) || ''
+      const nextPoll = await getPoll(pollId, storedToken)
       setPoll(nextPoll)
-      const storedId = localStorage.getItem(storageKey)
-      const existingResponse = nextPoll.participants.find((participant) => participant.id === storedId)
+      const existingResponse = nextPoll.participants.find(
+        (participant) => participant.id === nextPoll.viewerParticipantId,
+      )
       if (existingResponse) {
-        setParticipantId(existingResponse.id)
+        setParticipantToken(storedToken)
         setName(existingResponse.name)
         setVotes(existingResponse.votes)
       }
@@ -99,7 +107,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
       setError('Enter your name before saving.')
       return
     }
-    if (Object.keys(votes).length < poll.options.length) {
+    if (poll.options.some((option) => !votes[option.id])) {
       setError('Choose Yes, Maybe, or No for every date.')
       return
     }
@@ -108,9 +116,9 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
     setSaved(false)
     setError('')
     try {
-      const result = await saveResponse(pollId, { participantId, name, votes })
+      const result = await saveResponse(pollId, { participantId: participantToken, name, votes })
       setPoll(result.poll)
-      setParticipantId(result.participantId)
+      setParticipantToken(result.participantId)
       localStorage.setItem(storageKey, result.participantId)
       setSaved(true)
     } catch (requestError) {
@@ -250,7 +258,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
                 {saved ? <><CheckCircle2 size={17} /> Availability saved</> : error}
               </div>
               <button className="button button-primary button-large" type="submit" disabled={saving}>
-                {saving ? 'Saving...' : participantId ? 'Update availability' : 'Save availability'}
+                {saving ? 'Saving...' : participantToken ? 'Update availability' : 'Save availability'}
               </button>
             </div>
           </form>
@@ -341,7 +349,7 @@ export default function PollPage({ pollId, onCreateNew }: PollPageProps) {
               </thead>
               <tbody>
                 {poll.participants.map((participant) => (
-                  <tr className={participant.id === participantId ? 'current-user' : ''} key={participant.id}>
+                  <tr className={participant.id === poll.viewerParticipantId ? 'current-user' : ''} key={participant.id}>
                     <th><span className="avatar">{initials(participant.name)}</span>{participant.name}</th>
                     {poll.options.map((option) => {
                       const vote = participant.votes[option.id] || 'no'

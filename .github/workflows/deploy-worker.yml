@@ -1,0 +1,86 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - worker/**
+      - wrangler.jsonc
+      - package.json
+      - package-lock.json
+      - .github/workflows/deploy-worker.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test Worker API
+        run: npm test
+
+      - name: Prepare production Worker configuration
+        env:
+          KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          MAX_POLL_DATES: ${{ vars.MAX_POLL_DATES }}
+          MAX_POLL_RESPONSES: ${{ vars.MAX_POLL_RESPONSES }}
+          ALLOWED_ORIGINS: ${{ vars.ALLOWED_ORIGINS }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const namespaceId = process.env.KV_NAMESPACE_ID?.trim()
+          if (!/^[a-f0-9]{32}$/i.test(namespaceId || '')) {
+            throw new Error('Set CLOUDFLARE_KV_NAMESPACE_ID as a GitHub repository variable.')
+          }
+
+          const maxDates = process.env.MAX_POLL_DATES?.trim() || 'unlimited'
+          if (!/^(?:[1-9]\d*|0|none|unlimited)$/i.test(maxDates)) {
+            throw new Error('MAX_POLL_DATES must be a positive integer, 0, none, or unlimited.')
+          }
+
+          const maxResponses = process.env.MAX_POLL_RESPONSES?.trim() || '100'
+          if (!/^[1-9]\d*$/.test(maxResponses)) {
+            throw new Error('MAX_POLL_RESPONSES must be a positive integer.')
+          }
+
+          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+          config.kv_namespaces = [{ binding: 'POLLS', id: namespaceId }]
+          config.vars.MAX_POLL_DATES = maxDates
+          config.vars.MAX_POLL_RESPONSES = maxResponses
+          config.vars.ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.trim()
+            || `https://${process.env.GITHUB_REPOSITORY_OWNER.toLowerCase()}.github.io`
+          fs.writeFileSync('wrangler.ci.json', JSON.stringify(config, null, 2))
+          NODE
+
+      - name: Validate Worker bundle
+        run: npm run check:worker
+
+      - name: Deploy Worker
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: 4.59.1
+          command: deploy --config wrangler.ci.json
+
+      - name: Publish deployment URL
+        run: echo "Worker URL - ${{ steps.deploy.outputs.deployment-url }}" >> "$GITHUB_STEP_SUMMARY"

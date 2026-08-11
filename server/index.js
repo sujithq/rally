@@ -4,12 +4,16 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const modulePath = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(modulePath)
 const rootDirectory = path.resolve(__dirname, '..')
 const dataDirectory = path.join(rootDirectory, 'data')
-const dataFile = path.join(dataDirectory, 'polls.json')
+const dataFile = process.env.RALLY_DATA_FILE
+  ? path.resolve(process.env.RALLY_DATA_FILE)
+  : path.join(dataDirectory, 'polls.json')
 const distDirectory = path.join(rootDirectory, 'dist')
 const port = Number(process.env.PORT) || 4174
+const defaultMaxPollResponses = 100
 
 function parseMaxDates(value) {
   const normalizedValue = value?.trim().toLowerCase()
@@ -20,7 +24,17 @@ function parseMaxDates(value) {
   return Number(normalizedValue)
 }
 
+function parseMaxResponses(value) {
+  const normalizedValue = value?.trim()
+  if (!normalizedValue) return defaultMaxPollResponses
+  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
+    throw new Error('MAX_POLL_RESPONSES must be a positive integer.')
+  }
+  return Number(normalizedValue)
+}
+
 const maxPollDates = parseMaxDates(process.env.MAX_POLL_DATES)
+const maxPollResponses = parseMaxResponses(process.env.MAX_POLL_RESPONSES)
 const app = express()
 
 app.use(express.json({ limit: '64kb' }))
@@ -40,7 +54,7 @@ function updatePolls(updater) {
   const update = writeQueue.then(async () => {
     const polls = await readPolls()
     const result = updater(polls)
-    await fs.mkdir(dataDirectory, { recursive: true })
+    await fs.mkdir(path.dirname(dataFile), { recursive: true })
     await fs.writeFile(dataFile, JSON.stringify(polls, null, 2))
     return result
   })
@@ -51,6 +65,35 @@ function updatePolls(updater) {
 
 function cleanText(value, maxLength) {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : ''
+}
+
+function isValidDate(date) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1]
+}
+
+function hashParticipantToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex')
+}
+
+function serializePoll(poll, participantToken = '') {
+  const tokenHash = participantToken ? hashParticipantToken(participantToken) : ''
+  let viewerParticipantId
+  const participants = poll.participants.map(({ editTokenHash, ...participant }) => {
+    if (tokenHash && editTokenHash === tokenHash) viewerParticipantId = participant.id
+    return participant
+  })
+  return {
+    ...poll,
+    participants,
+    ...(viewerParticipantId ? { viewerParticipantId } : {}),
+  }
 }
 
 function validateOptions(options) {
@@ -66,7 +109,7 @@ function validateOptions(options) {
   for (const option of options) {
     const date = cleanText(option?.date, 10)
     const time = cleanText(option?.time, 5)
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return 'Every option needs a valid date.'
+    if (!isValidDate(date)) return 'Every option needs a valid date.'
     if (time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return 'Every time must be valid.'
     const key = `${date}-${time}`
     if (uniqueDates.has(key)) return 'Date options must be unique.'
@@ -113,7 +156,7 @@ app.post('/api/polls', async (request, response, next) => {
     }
 
     await updatePolls((polls) => polls.push(poll))
-    return response.status(201).json(poll)
+    return response.status(201).json(serializePoll(poll))
   } catch (error) {
     return next(error)
   }
@@ -124,7 +167,8 @@ app.get('/api/polls/:pollId', async (request, response, next) => {
     const polls = await readPolls()
     const poll = polls.find((item) => item.id === request.params.pollId)
     if (!poll) return response.status(404).json({ error: 'Poll not found.' })
-    return response.json(poll)
+    const participantToken = cleanText(request.get('X-Rally-Participant-Token'), 64)
+    return response.json(serializePoll(poll, participantToken))
   } catch (error) {
     return next(error)
   }
@@ -133,7 +177,7 @@ app.get('/api/polls/:pollId', async (request, response, next) => {
 app.put('/api/polls/:pollId/responses', async (request, response, next) => {
   try {
     const name = cleanText(request.body.name, 60)
-    const participantId = cleanText(request.body.participantId, 20)
+    const requestedToken = cleanText(request.body.participantId, 64)
     if (!name) return response.status(400).json({ error: 'Enter your name.' })
 
     const result = await updatePolls((polls) => {
@@ -146,28 +190,39 @@ app.put('/api/polls/:pollId/responses', async (request, response, next) => {
           return [option.id, ['yes', 'maybe', 'no'].includes(vote) ? vote : 'no']
         }),
       )
+      const requestedTokenHash = /^[a-f0-9]{48}$/.test(requestedToken)
+        ? hashParticipantToken(requestedToken)
+        : ''
       const existingParticipant = currentPoll.participants.find(
-        (participant) => participant.id === participantId,
+        (participant) => participant.editTokenHash === requestedTokenHash,
       )
+      if (!existingParticipant && currentPoll.participants.length >= maxPollResponses) {
+        return { responseLimitReached: true }
+      }
+      let participantToken = requestedToken
 
       if (existingParticipant) {
         existingParticipant.name = name
         existingParticipant.votes = votes
         existingParticipant.updatedAt = new Date().toISOString()
       } else {
+        participantToken = crypto.randomBytes(24).toString('hex')
         currentPoll.participants.push({
           id: crypto.randomBytes(5).toString('hex'),
+          editTokenHash: hashParticipantToken(participantToken),
           name,
           votes,
           updatedAt: new Date().toISOString(),
         })
       }
 
-      const savedParticipant = existingParticipant || currentPoll.participants.at(-1)
-      return { poll: currentPoll, participantId: savedParticipant.id }
+      return { poll: serializePoll(currentPoll, participantToken), participantId: participantToken }
     })
 
     if (!result) return response.status(404).json({ error: 'Poll not found.' })
+    if (result.responseLimitReached) {
+      return response.status(409).json({ error: 'This poll has reached its response limit.' })
+    }
     return response.json(result)
   } catch (error) {
     return next(error)
@@ -187,10 +242,20 @@ app.use(async (request, response, next) => {
 })
 
 app.use((error, _request, response, _next) => {
+  if (error?.type === 'entity.too.large') {
+    return response.status(413).json({ error: 'Request body is too large.' })
+  }
+  if (error?.type === 'entity.parse.failed') {
+    return response.status(400).json({ error: 'Request body must be valid JSON.' })
+  }
   console.error(error)
-  response.status(500).json({ error: 'Something went wrong.' })
+  return response.status(500).json({ error: 'Something went wrong.' })
 })
 
-app.listen(port, () => {
-  console.log(`Rally API listening on http://localhost:${port}`)
-})
+export { app }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === modulePath) {
+  app.listen(port, () => {
+    console.log(`Rally API listening on http://localhost:${port}`)
+  })
+}

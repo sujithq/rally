@@ -1,7 +1,9 @@
 import type { Poll, PollDraft, SavedResponse, Vote } from './types'
 
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options)
+  const response = await fetch(`${apiBaseUrl}${url}`, options)
   const payload = (await response.json()) as T & { error?: string }
 
   if (!response.ok) {
@@ -19,8 +21,10 @@ export function createPoll(draft: PollDraft) {
   })
 }
 
-export function getPoll(pollId: string) {
-  return request<Poll>(`/api/polls/${pollId}`)
+export function getPoll(pollId: string, participantToken?: string) {
+  return request<Poll>(`/api/polls/${pollId}`, {
+    headers: participantToken ? { 'X-Rally-Participant-Token': participantToken } : undefined,
+  })
 }
 
 export function getConfig() {

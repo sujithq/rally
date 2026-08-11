@@ -26,6 +26,7 @@ export interface Poll {
   status: 'open' | 'closed'
   options: PollOption[]
   participants: Participant[]
+  viewerParticipantId?: string
 }
 
 export interface PollDraft {

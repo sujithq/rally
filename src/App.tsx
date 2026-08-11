@@ -4,18 +4,23 @@ import { getConfig } from './api'
 import CreatePoll from './CreatePoll'
 import PollPage from './PollPage'
 
-function getPollId(pathname: string) {
-  return pathname.match(/^\/p\/([a-z0-9]+)\/?$/)?.[1]
+function getRoute() {
+  const route = window.location.hash.slice(1)
+  return route.startsWith('/') ? route : '/'
+}
+
+function getPollId(route: string) {
+  return route.match(/^\/p\/([a-z0-9]+)\/?$/)?.[1]
 }
 
 export default function App() {
-  const [pathname, setPathname] = useState(window.location.pathname)
+  const [route, setRoute] = useState(getRoute)
   const [maxDates, setMaxDates] = useState<number | null | undefined>(undefined)
 
   useEffect(() => {
-    const handlePopState = () => setPathname(window.location.pathname)
-    window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
+    const handleHashChange = () => setRoute(getRoute())
+    window.addEventListener('hashchange', handleHashChange)
+    return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
 
   useEffect(() => {
@@ -33,12 +38,11 @@ export default function App() {
   }, [])
 
   const navigate = (path: string) => {
-    window.history.pushState({}, '', path)
-    setPathname(path)
+    window.location.hash = path
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
-  const pollId = getPollId(pathname)
+  const pollId = getPollId(route)
 
   return (
     <div className="app-shell">
@@ -67,7 +71,7 @@ export default function App() {
       </header>
 
       {pollId ? (
-        <PollPage pollId={pollId} onCreateNew={() => navigate('/')} />
+        <PollPage key={pollId} pollId={pollId} onCreateNew={() => navigate('/')} />
       ) : maxDates === undefined ? (
         <main className="status-page"><p>Loading date settings...</p></main>
       ) : (
