@@ -22,7 +22,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.0.0",
+    "@vitejs/plugin-react": "^6.0.5",
     "ajv": "^8.20.0",
     "express": "^5.1.0",
     "lucide-react": "^0.539.0",
