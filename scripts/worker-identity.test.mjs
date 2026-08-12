@@ -16,17 +16,15 @@ function scriptList(scripts) {
   })
 }
 
-function workerScript(namespace, bindingName = 'POLLS') {
-  const form = new FormData()
-  form.set('metadata', JSON.stringify({
-    bindings: namespace ? [{
+function workerBindings(namespace, bindingName = 'POLLS') {
+  return new Response(JSON.stringify({
+    success: true,
+    result: namespace ? [{
       name: bindingName,
       type: 'kv_namespace',
       namespace_id: namespace,
     }] : [],
-  }))
-  form.set('index.js', new Blob(['export default {}'], { type: 'application/javascript' }))
-  return new Response(form)
+  }), { headers: { 'Content-Type': 'application/json' } })
 }
 
 function rallyWorker(id) {
@@ -43,8 +41,14 @@ function cloudflare(scripts, namespaces = {}) {
   return async (url) => {
     const pathname = new URL(url).pathname
     if (pathname.endsWith('/workers/scripts')) return scriptList(scripts)
-    const workerName = decodeURIComponent(pathname.split('/').at(-1))
-    return workerScript(namespaces[workerName])
+    const match = pathname.match(
+      /\/workers\/services\/([^/]+)\/environments\/production\/bindings$/,
+    )
+    if (!match) {
+      return new Response('export default {}', { headers: { 'Content-Type': 'text/plain' } })
+    }
+    const workerName = decodeURIComponent(match[1])
+    return workerBindings(namespaces[workerName])
   }
 }
 
@@ -102,7 +106,7 @@ test('finds the configured namespace under another binding name', async () => {
     instanceConfig: defaultInstanceConfig,
     fetchImpl: async (url) => new URL(url).pathname.endsWith('/workers/scripts')
       ? scriptList([rallyWorker(workerName)])
-      : workerScript(namespaceId.toUpperCase(), 'LEGACY_DATA'),
+      : workerBindings(namespaceId.toUpperCase(), 'LEGACY_DATA'),
   })
   assert.equal(result, workerName)
 })
@@ -153,5 +157,5 @@ test('fails closed when Cloudflare Worker metadata cannot be inspected', async (
     fetchImpl: async (url) => new URL(url).pathname.endsWith('/workers/scripts')
       ? scriptList([rallyWorker(defaultInstanceConfig.deployment.workerName)])
       : new Response('forbidden', { status: 403 }),
-  }), /Could not inspect Worker rally-scheduler-api \(403\)/)
+  }), /Could not inspect Worker bindings for rally-scheduler-api \(403\)/)
 })

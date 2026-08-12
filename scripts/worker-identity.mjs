@@ -15,28 +15,25 @@ export function freshWorkerName(namespaceId) {
   return `rally-${digest.slice(0, 24)}`
 }
 
-async function workerMetadata(response, workerName) {
+async function workerBindings(response, workerName) {
   if (!response.ok) {
-    throw new Error(`Could not inspect Worker ${workerName} (${response.status}).`)
+    throw new Error(`Could not inspect Worker bindings for ${workerName} (${response.status}).`)
   }
   try {
-    const form = await response.formData()
-    const metadataPart = form.get('metadata')
-    const metadata = typeof metadataPart === 'string'
-      ? metadataPart
-      : await metadataPart?.text()
-    return JSON.parse(metadata || '{}')
+    const payload = await response.json()
+    if (!payload.success || !Array.isArray(payload.result)) throw new Error()
+    return payload.result
   } catch {
-    throw new Error(`Worker ${workerName} did not return readable deployment metadata.`)
+    throw new Error(`Worker ${workerName} did not return readable binding metadata.`)
   }
 }
 
-function usesNamespace(metadata, namespaceId) {
-  return metadata.bindings?.some((binding) => (
+function usesNamespace(bindings, namespaceId) {
+  return bindings.some((binding) => (
     binding.type === 'kv_namespace'
       && typeof binding.namespace_id === 'string'
       && binding.namespace_id.toLowerCase() === namespaceId
-  )) || false
+  ))
 }
 
 export async function workerIdentity({
@@ -79,13 +76,13 @@ export async function workerIdentity({
   let configuredWorkerExists = false
   for (const candidate of payload.result) {
     const workerUrl = new URL(
-      `/client/v4/accounts/${normalizedAccountId}/workers/scripts/`
-        + encodeURIComponent(candidate.id),
+      `/client/v4/accounts/${normalizedAccountId}/workers/services/`
+        + `${encodeURIComponent(candidate.id)}/environments/production/bindings`,
       'https://api.cloudflare.com',
     )
-    const metadata = await workerMetadata(await fetchImpl(workerUrl, { headers }), candidate.id)
+    const bindings = await workerBindings(await fetchImpl(workerUrl, { headers }), candidate.id)
     if (candidate.id === workerName) configuredWorkerExists = true
-    if (usesNamespace(metadata, normalizedNamespaceId)) namespaceWorkers.push(candidate.id)
+    if (usesNamespace(bindings, normalizedNamespaceId)) namespaceWorkers.push(candidate.id)
   }
 
   if (namespaceWorkers.length > 1) {
