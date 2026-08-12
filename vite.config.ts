@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import instanceConfig from './rally.config.json'
+import instanceConfig from './rally.config.json' with { type: 'json' }
 
 function htmlAttribute(value: string) {
   return value
