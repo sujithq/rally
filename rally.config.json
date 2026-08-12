@@ -1,0 +1,27 @@
+{
+  "$schema": "./rally.config.schema.json",
+  "site": {
+    "name": "Rally",
+    "title": "Rally | Pick a date together",
+    "description": "Create a date poll and find the time that works for everyone.",
+    "themeColor": "#f4f1e8"
+  },
+  "deployment": {
+    "workerName": "rally-scheduler-api",
+    "apiBaseUrl": "https://rally-scheduler-api.sujith-quintelier.workers.dev",
+    "allowedOrigins": [
+      "https://sujithq.github.io",
+      "https://quintelier.dev",
+      "https://www.quintelier.dev",
+      "https://rally.quintelier.dev"
+    ]
+  },
+  "accounts": {
+    "mode": "optional",
+    "registration": "open"
+  },
+  "polls": {
+    "maxDates": null,
+    "maxResponses": 100
+  }
+}

@@ -3,12 +3,13 @@ import { CalendarCheck, ClipboardList, Plus, UserRound } from 'lucide-react'
 import { ApiError, claimAccountPoll, getAccountSession, getConfig, logoutAccount } from './api'
 import AccountPage from './AccountPage'
 import { clearAuthSession, getSessionToken, storeAuthSession } from './auth'
+import { bundledPublicConfig } from './config'
 import CreatePoll from './CreatePoll'
 import ManagePoll from './ManagePoll'
 import ManagePolls from './ManagePolls'
 import { getManagedPollReferences, rememberManagedPoll } from './managedPolls'
 import PollPage from './PollPage'
-import type { AccountUser, AuthSession } from './types'
+import type { AccountUser, AuthSession, PublicInstanceConfig } from './types'
 
 function getRoute() {
   const route = window.location.hash.slice(1)
@@ -26,7 +27,7 @@ function getManagementRoute(route: string) {
 
 export default function App() {
   const [route, setRoute] = useState(getRoute)
-  const [maxDates, setMaxDates] = useState<number | null | undefined>(undefined)
+  const [config, setConfig] = useState<PublicInstanceConfig>()
   const [currentUser, setCurrentUser] = useState<AccountUser | null>(null)
 
   useEffect(() => {
@@ -36,6 +37,12 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!config) return
+    if (config.accounts.mode === 'disabled') {
+      clearAuthSession()
+      setCurrentUser(null)
+      return
+    }
     const sessionToken = getSessionToken()
     if (!sessionToken) return
     let active = true
@@ -53,16 +60,16 @@ export default function App() {
     return () => {
       active = false
     }
-  }, [])
+  }, [config])
 
   useEffect(() => {
     let active = true
     getConfig()
-      .then((config) => {
-        if (active) setMaxDates(config.maxDates)
+      .then((loadedConfig) => {
+        if (active) setConfig(loadedConfig)
       })
       .catch(() => {
-        if (active) setMaxDates(null)
+        if (active) setConfig(bundledPublicConfig)
       })
     return () => {
       active = false
@@ -81,6 +88,9 @@ export default function App() {
     : undefined
   const isManageIndex = /^\/manage\/?$/.test(route)
   const isAccount = /^\/account\/?$/.test(route)
+  const maxDates = config?.polls.maxDates
+  const accountsEnabled = config?.accounts.mode !== 'disabled'
+  const registrationOpen = config?.accounts.registration === 'open'
 
   const authenticated = async (session: AuthSession) => {
     storeAuthSession(session)
@@ -102,24 +112,35 @@ export default function App() {
   }
 
   let content
-  if (isAccount) {
+  if (isAccount && config?.accounts.mode === 'disabled') {
+    content = (
+      <main className="status-page">
+        <h1>Accounts are disabled</h1>
+        <button className="button button-dark" type="button" onClick={() => navigate('/manage')}>
+          Open My polls
+        </button>
+      </main>
+    )
+  } else if (isAccount) {
     content = (
       <AccountPage
         user={currentUser}
+        registrationOpen={registrationOpen}
+        allowAnonymous={config?.accounts.mode === 'optional'}
         onAuthenticated={authenticated}
         onSignOut={signOut}
         onNavigate={navigate}
       />
     )
   } else if (managementRoute) {
-    content = maxDates === undefined ? (
+    content = config === undefined ? (
       <main className="status-page"><p>Loading date settings...</p></main>
     ) : (
       <ManagePoll
         key={managementRoute.pollId}
         pollId={managementRoute.pollId}
         managementToken={managementRoute.managementToken || savedManagementToken}
-        maxDates={maxDates}
+        maxDates={config.polls.maxDates}
         onNavigate={navigate}
       />
     )
@@ -127,12 +148,23 @@ export default function App() {
     content = <ManagePolls user={currentUser} onNavigate={navigate} />
   } else if (pollId) {
     content = <PollPage key={pollId} pollId={pollId} onCreateNew={() => navigate('/')} />
-  } else if (maxDates === undefined) {
+  } else if (config === undefined) {
     content = <main className="status-page"><p>Loading date settings...</p></main>
+  } else if (config.accounts.mode === 'required' && !currentUser) {
+    content = (
+      <AccountPage
+        user={null}
+        registrationOpen={registrationOpen}
+        allowAnonymous={false}
+        onAuthenticated={authenticated}
+        onSignOut={signOut}
+        onNavigate={navigate}
+      />
+    )
   } else {
     content = (
       <CreatePoll
-        maxDates={maxDates}
+        maxDates={config.polls.maxDates}
         onCreated={(poll) => {
           const reference = { id: poll.id, managementToken: poll.managementToken }
           rememberManagedPoll(reference)
@@ -152,13 +184,13 @@ export default function App() {
             <span className="brand-mark" aria-hidden="true">
               <CalendarCheck size={22} strokeWidth={2.4} />
             </span>
-            <span>Rally</span>
+            <span>{config?.site.name || bundledPublicConfig.site.name}</span>
           </button>
 
           <div className="header-actions">
             <span className="plan-pill">
               <span className="plan-dot" />
-              {maxDates === undefined ? 'Loading settings' : maxDates === null ? 'No date limit' : `${maxDates} dates max`}
+              {config === undefined ? 'Loading settings' : maxDates === null ? 'No date limit' : `${maxDates} dates max`}
             </span>
             {!isManageIndex && !managementRoute && (
               <button className="button button-small button-outline" type="button" onClick={() => navigate('/manage')}>
@@ -166,7 +198,7 @@ export default function App() {
                 <span className="header-action-label">My polls</span>
               </button>
             )}
-            {!isAccount && (
+            {accountsEnabled && !isAccount && (
               <button className="button button-small button-outline" type="button" onClick={() => navigate('/account')}>
                 <UserRound size={16} />
                 <span className="header-action-label">{currentUser?.name || 'Sign in'}</span>

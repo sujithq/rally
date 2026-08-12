@@ -5,6 +5,8 @@ import type { AccountUser, AuthSession } from './types'
 
 interface AccountPageProps {
   user: AccountUser | null
+  registrationOpen: boolean
+  allowAnonymous: boolean
   onAuthenticated: (session: AuthSession) => Promise<void>
   onSignOut: () => Promise<void>
   onNavigate: (path: string) => void
@@ -12,6 +14,8 @@ interface AccountPageProps {
 
 export default function AccountPage({
   user,
+  registrationOpen,
+  allowAnonymous,
   onAuthenticated,
   onSignOut,
   onNavigate,
@@ -85,15 +89,17 @@ export default function AccountPage({
           >
             Sign in
           </button>
-          <button
-            className={mode === 'register' ? 'active' : ''}
-            type="button"
-            role="tab"
-            aria-selected={mode === 'register'}
-            onClick={() => changeMode('register')}
-          >
-            Create account
-          </button>
+          {registrationOpen && (
+            <button
+              className={mode === 'register' ? 'active' : ''}
+              type="button"
+              role="tab"
+              aria-selected={mode === 'register'}
+              onClick={() => changeMode('register')}
+            >
+              Create account
+            </button>
+          )}
         </div>
 
         <form className="account-form" onSubmit={submit}>
@@ -143,9 +149,11 @@ export default function AccountPage({
           </button>
         </form>
 
-        <button className="account-skip" type="button" onClick={() => onNavigate('/')}>
-          Continue without an account
-        </button>
+        {allowAnonymous && (
+          <button className="account-skip" type="button" onClick={() => onNavigate('/')}>
+            Continue without an account
+          </button>
+        )}
       </section>
     </main>
   )

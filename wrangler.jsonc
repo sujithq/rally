@@ -1,5 +1,4 @@
 {
-  "name": "rally-scheduler-api",
   "main": "worker/index.js",
   "compatibility_date": "2026-08-10",
   "workers_dev": true,
@@ -31,11 +30,6 @@
       "new_sqlite_classes": ["AccountCoordinator"]
     }
   ],
-  "vars": {
-    "MAX_POLL_DATES": "unlimited",
-    "MAX_POLL_RESPONSES": "100",
-    "ALLOWED_ORIGINS": "*"
-  },
   "observability": {
     "enabled": true
   }

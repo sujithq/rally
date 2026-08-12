@@ -1,4 +1,5 @@
 import { getSessionToken } from './auth'
+import { apiBaseUrl, bundledPublicConfig } from './config'
 import type {
   AccountUser,
   AuthSession,
@@ -6,11 +7,10 @@ import type {
   Poll,
   PollDraft,
   PollUpdate,
+  PublicInstanceConfig,
   SavedResponse,
   Vote,
 } from './types'
-
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -44,8 +44,18 @@ export function getPoll(pollId: string, participantToken?: string) {
   })
 }
 
-export function getConfig() {
-  return request<{ maxDates: number | null }>('/api/config')
+export async function getConfig() {
+  const config = await request<Partial<PublicInstanceConfig> & { maxDates?: number | null }>(
+    '/api/config',
+  )
+  return {
+    site: config.site || bundledPublicConfig.site,
+    accounts: config.accounts || bundledPublicConfig.accounts,
+    polls: config.polls || {
+      ...bundledPublicConfig.polls,
+      maxDates: config.maxDates ?? bundledPublicConfig.polls.maxDates,
+    },
+  }
 }
 
 export function saveResponse(

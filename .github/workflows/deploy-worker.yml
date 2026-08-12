@@ -8,6 +8,9 @@ on:
       - wrangler.jsonc
       - package.json
       - package-lock.json
+      - rally.config.json
+      - rally.config.schema.json
+      - scripts/**
       - .github/workflows/deploy-worker.yml
   workflow_dispatch:
 
@@ -30,6 +33,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test application
+        run: npm test
 
       - name: Validate Cloudflare secrets
         env:
@@ -57,6 +66,13 @@ jobs:
           }
           NODE
 
+      - name: Validate Worker deployment identity
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+        run: npm run worker:identity
+
       - name: Verify Cloudflare Worker setup
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -64,9 +80,9 @@ jobs:
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs'
-          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+          const config = JSON.parse(fs.readFileSync('rally.config.json', 'utf8'))
           const url = new URL(
-            `/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/services/${config.name}`,
+            `/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/services/${config.deployment.workerName}`,
             'https://api.cloudflare.com',
           )
           const response = await fetch(url, {
@@ -109,44 +125,10 @@ jobs:
           }
           NODE
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Test Worker API
-        run: npm test
-
       - name: Prepare production Worker configuration
         env:
-          KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
-          MAX_POLL_DATES: ${{ vars.MAX_POLL_DATES }}
-          MAX_POLL_RESPONSES: ${{ vars.MAX_POLL_RESPONSES }}
-          ALLOWED_ORIGINS: ${{ vars.ALLOWED_ORIGINS }}
-        run: |
-          node <<'NODE'
-          const fs = require('node:fs')
-          const namespaceId = process.env.KV_NAMESPACE_ID?.trim()
-          if (!/^[a-f0-9]{32}$/i.test(namespaceId || '')) {
-            throw new Error('Set CLOUDFLARE_KV_NAMESPACE_ID as a GitHub Actions repository secret.')
-          }
-
-          const maxDates = process.env.MAX_POLL_DATES?.trim() || 'unlimited'
-          if (!/^(?:[1-9]\d*|0|none|unlimited)$/i.test(maxDates)) {
-            throw new Error('MAX_POLL_DATES must be a positive integer, 0, none, or unlimited.')
-          }
-
-          const maxResponses = process.env.MAX_POLL_RESPONSES?.trim() || '100'
-          if (!/^[1-9]\d*$/.test(maxResponses)) {
-            throw new Error('MAX_POLL_RESPONSES must be a positive integer.')
-          }
-
-          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
-          config.kv_namespaces = [{ binding: 'POLLS', id: namespaceId }]
-          config.vars.MAX_POLL_DATES = maxDates
-          config.vars.MAX_POLL_RESPONSES = maxResponses
-          config.vars.ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.trim()
-            || `https://${process.env.GITHUB_REPOSITORY_OWNER.toLowerCase()}.github.io`
-          fs.writeFileSync('wrangler.ci.json', JSON.stringify(config, null, 2))
-          NODE
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+        run: npm run worker:config
 
       - name: Validate Worker bundle
         run: npm run check:worker

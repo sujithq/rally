@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { pbkdf2Sync } from 'node:crypto'
 import test from 'node:test'
+import defaultInstanceConfig from '../rally.config.json' with { type: 'json' }
 import worker, { AccountCoordinator, PollCoordinator } from './index.js'
 
 class MemoryDurableStorage {
@@ -73,6 +74,8 @@ class MemoryDurableNamespace {
   }
 }
 
+const testReleaseFingerprint = 'a'.repeat(64)
+
 class MemoryKv {
   values = new Map()
   metadata = new Map()
@@ -121,12 +124,19 @@ class MemoryKv {
   }
 }
 
-function createEnvironment(overrides = {}) {
+function createEnvironment({ config: configOverrides = {}, ...overrides } = {}) {
+  const config = {
+    ...structuredClone(defaultInstanceConfig),
+    ...configOverrides,
+    site: { ...defaultInstanceConfig.site, ...configOverrides.site },
+    deployment: { ...defaultInstanceConfig.deployment, ...configOverrides.deployment },
+    accounts: { ...defaultInstanceConfig.accounts, ...configOverrides.accounts },
+    polls: { ...defaultInstanceConfig.polls, ...configOverrides.polls },
+  }
   const environment = {
     POLLS: new MemoryKv(),
-    MAX_POLL_DATES: 'unlimited',
-    MAX_POLL_RESPONSES: '100',
-    ALLOWED_ORIGINS: 'https://quintelier.dev',
+    RALLY_CONFIG: config,
+    RALLY_RELEASE_FINGERPRINT: testReleaseFingerprint,
     ...overrides,
   }
   environment.POLL_COORDINATORS ||= new MemoryDurableNamespace(
@@ -925,7 +935,7 @@ test('throttles Worker account registration before creating another account', as
 })
 
 test('enforces a configured date limit', async () => {
-  const environment = createEnvironment({ MAX_POLL_DATES: '2' })
+  const environment = createEnvironment({ config: { polls: { maxDates: 2 } } })
   const response = await call(environment, '/api/polls', {
     method: 'POST',
     body: JSON.stringify(pollDraft(3)),
@@ -933,6 +943,90 @@ test('enforces a configured date limit', async () => {
 
   assert.equal(response.status, 400)
   assert.deepEqual(await response.json(), { error: 'Polls can include up to 2 dates.' })
+})
+
+test('disables Worker account routes while preserving anonymous poll creation', async () => {
+  const environment = createEnvironment({
+    config: { accounts: { mode: 'disabled', registration: 'closed' } },
+  })
+  const credentials = {
+    email: 'ada@example.com',
+    password: 'correct horse battery staple',
+  }
+
+  const registration = await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'Ada', ...credentials }),
+  })
+  assert.equal(registration.status, 403)
+  assert.deepEqual(await registration.json(), { error: 'Accounts are disabled.' })
+  assert.equal((await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(credentials),
+  })).status, 403)
+  assert.equal((await call(environment, '/api/account/polls')).status, 403)
+
+  const created = await call(environment, '/api/polls', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ignored-when-accounts-are-disabled' },
+    body: JSON.stringify(pollDraft(1)),
+  })
+  assert.equal(created.status, 201)
+})
+
+test('requires a Worker account for poll creation when configured', async () => {
+  const environment = createEnvironment({
+    config: { accounts: { mode: 'required', registration: 'open' } },
+  })
+  assert.equal((await call(environment, '/api/polls', {
+    method: 'POST',
+    body: JSON.stringify(pollDraft(1)),
+  })).status, 401)
+
+  const registration = await (await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Ada',
+      email: 'required@example.com',
+      password: 'correct horse battery staple',
+    }),
+  })).json()
+  const created = await call(environment, '/api/polls', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${registration.token}` },
+    body: JSON.stringify(pollDraft(1)),
+  })
+  assert.equal(created.status, 201)
+})
+
+test('closes Worker registration without disabling sign-in', async () => {
+  const environment = createEnvironment({
+    config: { accounts: { mode: 'optional', registration: 'open' } },
+  })
+  const credentials = {
+    email: 'closed@example.com',
+    password: 'correct horse battery staple',
+  }
+  assert.equal((await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'Ada', ...credentials }),
+  })).status, 201)
+  environment.RALLY_CONFIG.accounts.registration = 'closed'
+
+  const registration = await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Grace',
+      email: 'new-account@example.com',
+      password: credentials.password,
+    }),
+  })
+  assert.equal(registration.status, 403)
+  assert.deepEqual(await registration.json(), { error: 'Registration is closed.' })
+  assert.equal((await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(credentials),
+  })).status, 200)
 })
 
 test('keeps edit tokens private and does not authorize updates with public participant IDs', async () => {
@@ -1110,7 +1204,7 @@ test('does not persist a response when participant hydration fails', async () =>
 })
 
 test('enforces the configured response limit', async () => {
-  const environment = createEnvironment({ MAX_POLL_RESPONSES: '1' })
+  const environment = createEnvironment({ config: { polls: { maxResponses: 1 } } })
   const createResponse = await call(environment, '/api/polls', {
     method: 'POST',
     body: JSON.stringify(pollDraft(1)),
@@ -1132,7 +1226,7 @@ test('enforces the configured response limit', async () => {
 })
 
 test('bounds KV scans when response metadata is malformed', async () => {
-  const environment = createEnvironment({ MAX_POLL_RESPONSES: '2' })
+  const environment = createEnvironment({ config: { polls: { maxResponses: 2 } } })
   const createResponse = await call(environment, '/api/polls', {
     method: 'POST',
     body: JSON.stringify(pollDraft(1)),
@@ -1172,9 +1266,15 @@ test('rejects impossible calendar dates', async () => {
 })
 
 test('returns configuration, management CORS methods, and rejects unapproved origins', async () => {
-  const environment = createEnvironment({ MAX_POLL_DATES: '20' })
+  const environment = createEnvironment({ config: { polls: { maxDates: 20 } } })
   const configResponse = await call(environment, '/api/config')
-  assert.deepEqual(await configResponse.json(), { maxDates: 20 })
+  assert.deepEqual(await configResponse.json(), {
+    maxDates: 20,
+    site: defaultInstanceConfig.site,
+    accounts: defaultInstanceConfig.accounts,
+    polls: { ...defaultInstanceConfig.polls, maxDates: 20 },
+    releaseFingerprint: testReleaseFingerprint,
+  })
 
   const preflightResponse = await call(environment, '/api/polls/poll-one', { method: 'OPTIONS' })
   assert.equal(preflightResponse.status, 204)

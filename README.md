@@ -4,29 +4,68 @@ Rally is a static React scheduling app. GitHub Pages hosts the client, while a C
 
 ## Local development
 
-Use the JSON-file Express API:
+Edit `rally.config.json`, then run the static client with the JSON-file Express API:
 
 ```sh
 npm install
 npm run dev
 ```
 
+Run `npm run config:check` after changing instance settings. The schema reference in
+`rally.config.json` also provides validation and completion in supporting editors.
+
+## Instance administration
+
+Rally deliberately has no in-app administrator account or console. Repository maintainers
+administer an instance by reviewing and committing `rally.config.json`. Git history provides the
+audit trail; protecting the default branch and requiring pull-request review is recommended for
+production instances.
+
+The committed configuration contains public settings only:
+
+| Setting | Purpose |
+| --- | --- |
+| `site` | Instance name, page metadata, and browser theme color |
+| `deployment.workerName` | Cloudflare Worker service name |
+| `deployment.apiBaseUrl` | HTTPS Worker URL used by the GitHub Pages client |
+| `deployment.allowedOrigins` | Exact HTTPS browser origins allowed by Worker CORS |
+| `accounts.mode` | `disabled`, `optional`, or `required` for poll creation |
+| `accounts.registration` | `open` or `closed` self-service registration |
+| `polls.maxDates` | Positive date limit, or `null` for no limit |
+| `polls.maxResponses` | Positive response limit per poll |
+
+When accounts are disabled, registration must be closed. In required mode, visitors must sign in
+before creating a poll. Closing registration does not prevent existing accounts from signing in.
+These policies are enforced by both APIs; the client only adapts the visible controls.
+
+Never put credentials, tokens, namespace IDs, or other secrets in `rally.config.json`. The public
+configuration is bundled into both deployments, and the non-deployment portion is available from
+`GET /api/config`.
+
+Before deployment, the workflow inspects Cloudflare's current Worker bindings. An existing instance
+must keep the Worker already bound to its KV namespace because deploying under another name would
+create fresh Durable Object namespaces and strand organizer accounts. For a new namespace, every
+deployment converges on the same Worker name derived from a one-way hash of the namespace ID. If the
+configured name differs, the workflow reports the required name; update both `deployment.workerName`
+and `deployment.apiBaseUrl`, then rerun it. Moving an existing instance to a new Worker requires an
+explicit account and Durable Object migration that Rally does not automate.
+
 ## Deployment setup
 
-1. In Cloudflare **Workers & Pages**, register the account's one-time `workers.dev` subdomain. The deployed API URL will use this account-wide name.
-2. Create a Workers KV namespace in Cloudflare and copy its 32-character namespace ID.
-3. In Cloudflare **Manage Account > Account API Tokens**, create a token from the **Edit Cloudflare Workers** template. Scope its account resources to the same account whose ID you copy. A custom token must include at least **Workers Scripts Write/Edit**, **Workers KV Storage Write/Edit**, and **Account Settings Read** for that account.
+1. In Cloudflare **Workers & Pages**, register the account's one-time `workers.dev` subdomain.
+2. Create a Workers KV namespace and copy its 32-character namespace ID.
+3. In Cloudflare **Manage Account > Account API Tokens**, create a token from the **Edit Cloudflare Workers** template. Scope it to the deployment account. A custom token needs **Workers Scripts Write/Edit** and **Account Settings Read**.
 4. Add GitHub Actions repository secrets named `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_KV_NAMESPACE_ID`.
-5. Keep the KV namespace name for your own reference; deployment only needs its 32-character namespace ID.
-6. Run the **Deploy Cloudflare Worker** workflow once. Wrangler provisions the poll and account Durable Object namespaces during this deployment; copy the Worker URL from the job summary.
-7. Add that HTTPS URL as the GitHub Actions variable `VITE_API_BASE_URL`.
-8. In the repository Pages settings, choose **GitHub Actions** as the source, then run **Deploy GitHub Pages**.
+5. Edit `rally.config.json`. Set the GitHub Pages and custom-domain origins, branding, and instance policies. Existing instances must retain their Worker name and URL.
+6. Run `npm ci`, `npm run config:check`, and `npm test` locally.
+7. Run **Deploy Cloudflare Worker**. For a fresh namespace, use the hash-derived Worker name reported by the first run to update `deployment.workerName` and its expected `https://<worker>.<subdomain>.workers.dev` URL, then rerun the workflow. It generates Wrangler configuration from the public config plus the KV secret and provisions the Durable Object namespaces.
+8. Confirm the published Worker URL matches `deployment.apiBaseUrl`.
+9. In repository Pages settings, choose **GitHub Actions** as the source, then run **Deploy GitHub Pages**.
 
-Optional repository variables:
-
-- `MAX_POLL_DATES`: a positive integer, `0`, `none`, or `unlimited`; defaults to unlimited.
-- `MAX_POLL_RESPONSES`: a positive integer; defaults to 100 to bound API work and response size.
-- `ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API. Include the Pages custom-domain origin when one is configured; it defaults to the repository owner's `github.io` origin during deployment.
+No GitHub Actions repository variables are required. A custom Pages domain must also appear as an
+exact origin in `deployment.allowedOrigins` before the Worker is redeployed. When public settings or
+the API URL change, the Pages workflow waits until the deployed Worker reports the committed settings;
+it will not publish a client ahead of a failed or pending Worker deployment.
 
 Shared poll and account URLs use hash routing, such as `https://rally.quintelier.dev/#/p/abc123` and `https://rally.quintelier.dev/#/account`, so opening or refreshing them works on GitHub Pages. The static client sends account sessions to the cross-origin Worker as bearer tokens, so authentication does not depend on server-rendered routes or same-origin cookies.
 

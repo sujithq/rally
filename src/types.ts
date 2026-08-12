@@ -1,4 +1,36 @@
 export type Vote = 'yes' | 'maybe' | 'no'
+export type AccountMode = 'disabled' | 'optional' | 'required'
+
+export interface SiteConfig {
+  name: string
+  title: string
+  description: string
+  themeColor: string
+}
+
+export interface AccountConfig {
+  mode: AccountMode
+  registration: 'open' | 'closed'
+}
+
+export interface PollConfig {
+  maxDates: number | null
+  maxResponses: number
+}
+
+export interface PublicInstanceConfig {
+  site: SiteConfig
+  accounts: AccountConfig
+  polls: PollConfig
+}
+
+export interface InstanceConfig extends PublicInstanceConfig {
+  deployment: {
+    workerName: string
+    apiBaseUrl: string
+    allowedOrigins: string[]
+  }
+}
 
 export interface PollOptionInput {
   date: string

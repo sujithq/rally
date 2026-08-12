@@ -3,11 +3,17 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
+import { validateConfig } from '../scripts/validate-config.mjs'
 
 const modulePath = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(modulePath)
 const rootDirectory = path.resolve(__dirname, '..')
 const dataDirectory = path.join(rootDirectory, 'data')
+const instanceConfig = validateConfig(
+  process.env.RALLY_CONFIG_FILE
+    ? path.resolve(process.env.RALLY_CONFIG_FILE)
+    : path.join(rootDirectory, 'rally.config.json'),
+)
 const dataFile = process.env.RALLY_DATA_FILE
   ? path.resolve(process.env.RALLY_DATA_FILE)
   : path.join(dataDirectory, 'polls.json')
@@ -16,7 +22,6 @@ const authDataFile = process.env.RALLY_AUTH_DATA_FILE
   : path.join(dataDirectory, 'auth.json')
 const distDirectory = path.join(rootDirectory, 'dist')
 const port = Number(process.env.PORT) || 4174
-const defaultMaxPollResponses = 100
 const passwordIterations = 310_000
 const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000
 const maxActiveSessions = 10
@@ -35,26 +40,8 @@ const registrationAttemptsByIp = new Map()
 const loginQueues = new Map()
 const rateLimitSweepTimes = new WeakMap()
 
-function parseMaxDates(value) {
-  const normalizedValue = value?.trim().toLowerCase()
-  if (!normalizedValue || ['0', 'none', 'unlimited'].includes(normalizedValue)) return null
-  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
-    throw new Error('MAX_POLL_DATES must be a positive integer, 0, none, or unlimited.')
-  }
-  return Number(normalizedValue)
-}
-
-function parseMaxResponses(value) {
-  const normalizedValue = value?.trim()
-  if (!normalizedValue) return defaultMaxPollResponses
-  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
-    throw new Error('MAX_POLL_RESPONSES must be a positive integer.')
-  }
-  return Number(normalizedValue)
-}
-
-const maxPollDates = parseMaxDates(process.env.MAX_POLL_DATES)
-const maxPollResponses = parseMaxResponses(process.env.MAX_POLL_RESPONSES)
+const maxPollDates = instanceConfig.polls.maxDates
+const maxPollResponses = instanceConfig.polls.maxResponses
 const app = express()
 
 app.use(express.json({ limit: '64kb' }))
@@ -293,6 +280,7 @@ function addSession(data, accountId) {
 }
 
 async function authenticatedAccount(request) {
+  if (instanceConfig.accounts.mode === 'disabled') return null
   const token = requestSessionToken(request)
   if (!token) return null
   const data = await readAuthData()
@@ -388,11 +376,22 @@ app.get('/api/health', (_request, response) => {
 })
 
 app.get('/api/config', (_request, response) => {
-  response.json({ maxDates: maxPollDates })
+  response.json({
+    maxDates: instanceConfig.polls.maxDates,
+    site: instanceConfig.site,
+    accounts: instanceConfig.accounts,
+    polls: instanceConfig.polls,
+  })
 })
 
 app.post('/api/auth/register', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
+    if (instanceConfig.accounts.registration === 'closed') {
+      return response.status(403).json({ error: 'Registration is closed.' })
+    }
     const email = normalizeEmail(request.body.email)
     const name = cleanText(request.body.name, 60)
     const password = typeof request.body.password === 'string' ? request.body.password : ''
@@ -432,6 +431,9 @@ app.post('/api/auth/register', async (request, response, next) => {
 
 app.post('/api/auth/login', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
     const email = normalizeEmail(request.body.email)
     const password = typeof request.body.password === 'string' ? request.body.password : ''
     if (!consumeLoginRateLimit(request)) {
@@ -467,6 +469,9 @@ app.post('/api/auth/login', async (request, response, next) => {
 
 app.get('/api/auth/session', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
     const account = await authenticatedAccount(request)
     if (!account) return response.status(401).json({ error: 'Sign in required.' })
     return response.json({ user: publicAccount(account) })
@@ -477,6 +482,9 @@ app.get('/api/auth/session', async (request, response, next) => {
 
 app.delete('/api/auth/session', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
     const token = requestSessionToken(request)
     if (token) {
       const tokenHash = hashParticipantToken(token)
@@ -492,6 +500,9 @@ app.delete('/api/auth/session', async (request, response, next) => {
 
 app.get('/api/account/polls', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
     const account = await authenticatedAccount(request)
     if (!account) return response.status(401).json({ error: 'Sign in required.' })
     const polls = await readPolls()
@@ -505,6 +516,9 @@ app.get('/api/account/polls', async (request, response, next) => {
 
 app.post('/api/account/polls/claim', async (request, response, next) => {
   try {
+    if (instanceConfig.accounts.mode === 'disabled') {
+      return response.status(403).json({ error: 'Accounts are disabled.' })
+    }
     const account = await authenticatedAccount(request)
     if (!account) return response.status(401).json({ error: 'Sign in required.' })
     const pollId = cleanText(request.body.pollId, 20)
@@ -540,7 +554,12 @@ app.post('/api/polls', async (request, response, next) => {
     }
 
     const account = await authenticatedAccount(request)
-    if (request.get('Authorization') && !account) {
+    if (instanceConfig.accounts.mode !== 'disabled'
+      && request.get('Authorization')
+      && !account) {
+      return response.status(401).json({ error: 'Sign in required.' })
+    }
+    if (instanceConfig.accounts.mode === 'required' && !account) {
       return response.status(401).json({ error: 'Sign in required.' })
     }
     const poll = {

@@ -1,5 +1,6 @@
+import defaultInstanceConfig from '../rally.config.json' with { type: 'json' }
+
 const maxBodyBytes = 64 * 1024
-const defaultMaxPollResponses = 100
 const voteValues = ['yes', 'maybe', 'no']
 const passwordIterations = 100_000
 const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000
@@ -14,6 +15,20 @@ const maxRegistrationAttemptsPerIp = 10
 const deletionPageLimit = 900
 const deletionRetryMs = 60 * 1000
 const accountPollPageSize = 50
+
+function instanceConfig(env) {
+  return env?.RALLY_CONFIG || defaultInstanceConfig
+}
+
+function publicInstanceConfig(config, releaseFingerprint) {
+  return {
+    maxDates: config.polls.maxDates,
+    site: config.site,
+    accounts: config.accounts,
+    polls: config.polls,
+    releaseFingerprint,
+  }
+}
 
 class RequestError extends Error {
   constructor(message, status = 400) {
@@ -582,24 +597,6 @@ function isValidDate(date) {
   return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1]
 }
 
-function parseMaxDates(value) {
-  const normalizedValue = value?.trim().toLowerCase()
-  if (!normalizedValue || ['0', 'none', 'unlimited'].includes(normalizedValue)) return null
-  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
-    throw new Error('MAX_POLL_DATES must be a positive integer, 0, none, or unlimited.')
-  }
-  return Number(normalizedValue)
-}
-
-function parseMaxResponses(value) {
-  const normalizedValue = value?.trim()
-  if (!normalizedValue) return defaultMaxPollResponses
-  if (!/^\d+$/.test(normalizedValue) || Number(normalizedValue) < 1) {
-    throw new Error('MAX_POLL_RESPONSES must be a positive integer.')
-  }
-  return Number(normalizedValue)
-}
-
 function createId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(5)), (value) =>
     value.toString(16).padStart(2, '0'),
@@ -782,12 +779,9 @@ function validateOptions(options, maxDates) {
 
 function allowedOrigin(request, env) {
   const origin = request.headers.get('Origin')
-  const configuredOrigins = cleanText(env.ALLOWED_ORIGINS, 2000)
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
+  const configuredOrigins = instanceConfig(env).deployment.allowedOrigins
 
-  if (!origin || configuredOrigins.length === 0 || configuredOrigins.includes('*')) return '*'
+  if (!origin) return configuredOrigins[0]
   return configuredOrigins.includes(origin) ? origin : null
 }
 
@@ -909,6 +903,7 @@ function requestSession(request) {
 }
 
 async function authenticatedAccount(request, env) {
+  if (instanceConfig(env).accounts.mode === 'disabled') return null
   const session = requestSession(request)
   if (!session) return null
   try {
@@ -984,18 +979,23 @@ function updatedOptions(options, currentPoll, maxDates) {
   })
 }
 
-async function createPoll(request, env) {
+async function createPoll(request, env, config) {
   const body = await readJson(request)
   const title = cleanText(body.title, 100)
   const organizer = cleanText(body.organizer, 60)
-  const optionsError = validateOptions(body.options, parseMaxDates(env.MAX_POLL_DATES))
+  const optionsError = validateOptions(body.options, config.polls.maxDates)
 
   if (!title || !organizer || optionsError) {
     throw new RequestError(optionsError || 'A title and organizer name are required.')
   }
 
   const authentication = await authenticatedAccount(request, env)
-  if (request.headers.has('Authorization') && !authentication) {
+  if (config.accounts.mode !== 'disabled'
+    && request.headers.has('Authorization')
+    && !authentication) {
+    throw new RequestError('Sign in required.', 401)
+  }
+  if (config.accounts.mode === 'required' && !authentication) {
     throw new RequestError('Sign in required.', 401)
   }
   const poll = {
@@ -1302,35 +1302,57 @@ async function claimAccountPoll(request, env, maxResponses) {
 
 async function route(request, env) {
   const url = new URL(request.url)
-  const maxDates = parseMaxDates(env.MAX_POLL_DATES)
-  const maxResponses = parseMaxResponses(env.MAX_POLL_RESPONSES)
+  const config = instanceConfig(env)
+  const maxDates = config.polls.maxDates
+  const maxResponses = config.polls.maxResponses
 
   if (request.method === 'GET' && url.pathname === '/api/health') {
     return json(request, env, { status: 'ok' })
   }
   if (request.method === 'GET' && url.pathname === '/api/config') {
-    return json(request, env, { maxDates })
+    return json(request, env, publicInstanceConfig(config, env.RALLY_RELEASE_FINGERPRINT || null))
   }
   if (request.method === 'POST' && url.pathname === '/api/auth/register') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
+    if (config.accounts.registration === 'closed') {
+      throw new RequestError('Registration is closed.', 403)
+    }
     return registerAccount(request, env)
   }
   if (request.method === 'POST' && url.pathname === '/api/auth/login') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
     return loginAccount(request, env)
   }
   if (request.method === 'GET' && url.pathname === '/api/auth/session') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
     return getAccountSession(request, env)
   }
   if (request.method === 'DELETE' && url.pathname === '/api/auth/session') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
     return logoutAccount(request, env)
   }
   if (request.method === 'GET' && url.pathname === '/api/account/polls') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
     return getAccountPolls(request, env)
   }
   if (request.method === 'POST' && url.pathname === '/api/account/polls/claim') {
+    if (config.accounts.mode === 'disabled') {
+      throw new RequestError('Accounts are disabled.', 403)
+    }
     return claimAccountPoll(request, env, maxResponses)
   }
   if (request.method === 'POST' && url.pathname === '/api/polls') {
-    return createPoll(request, env)
+    return createPoll(request, env, config)
   }
 
   const pollMatch = url.pathname.match(/^\/api\/polls\/([a-f0-9]{10})$/)

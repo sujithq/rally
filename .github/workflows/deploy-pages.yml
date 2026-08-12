@@ -5,13 +5,19 @@ on:
     branches: [main]
     paths:
       - src/**
+      - worker/**
       - public/**
       - index.html
       - vite.config.ts
+      - wrangler.jsonc
       - tsconfig*.json
       - package.json
       - package-lock.json
+      - rally.config.json
+      - rally.config.schema.json
+      - scripts/**
       - .github/workflows/deploy-pages.yml
+      - .github/workflows/deploy-worker.yml
   workflow_dispatch:
 
 permissions:
@@ -42,21 +48,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Wait for matching Worker configuration
+        env:
+          RALLY_CONFIG_VERIFY_ATTEMPTS: 24
+          RALLY_CONFIG_VERIFY_INTERVAL_MS: 10000
+        run: npm run config:verify-deployed
+
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v5
 
-      - name: Validate API URL
-        env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
-        run: |
-          node -e "const value = process.env.VITE_API_BASE_URL; if (!value) throw new Error('Set VITE_API_BASE_URL as a GitHub repository variable.'); const url = new URL(value); if (url.protocol !== 'https:') throw new Error('VITE_API_BASE_URL must use HTTPS.');"
-
       - name: Build static site
         env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
           VITE_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
-        run: npm run build
+        run: npm run build:pages
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -4,6 +4,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
+import defaultInstanceConfig from '../rally.config.json' with { type: 'json' }
 
 let baseUrl
 let server
@@ -14,8 +15,11 @@ before(async () => {
   temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'rally-api-'))
   process.env.RALLY_DATA_FILE = path.join(temporaryDirectory, 'polls.json')
   process.env.RALLY_AUTH_DATA_FILE = path.join(temporaryDirectory, 'auth.json')
-  process.env.MAX_POLL_DATES = 'unlimited'
-  process.env.MAX_POLL_RESPONSES = '2'
+  process.env.RALLY_CONFIG_FILE = path.join(temporaryDirectory, 'rally.config.json')
+  await fs.writeFile(process.env.RALLY_CONFIG_FILE, JSON.stringify({
+    ...defaultInstanceConfig,
+    polls: { ...defaultInstanceConfig.polls, maxResponses: 2 },
+  }))
 
   const serverModule = await import('./index.js')
   consumeRateLimit = serverModule.consumeRateLimit
