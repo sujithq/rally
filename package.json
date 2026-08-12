@@ -28,6 +28,6 @@
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "concurrently": "^9.2.0",
-    "typescript": "^5.9.2"
+    "typescript": "^7.0.2"
   }
 }
