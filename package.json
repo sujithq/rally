@@ -22,19 +22,19 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.0.0",
+    "@vitejs/plugin-react": "^6.0.5",
     "ajv": "^8.20.0",
     "express": "^5.1.0",
-    "lucide-react": "^0.539.0",
+    "lucide-react": "^1.28.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "vite": "^7.1.1"
+    "vite": "^8.2.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
-    "concurrently": "^9.2.0",
-    "typescript": "^5.9.2"
+    "concurrently": "^10.0.4",
+    "typescript": "^7.0.2"
   }
 }
