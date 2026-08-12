@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { pbkdf2Sync } from 'node:crypto'
 import test from 'node:test'
 import worker, { AccountCoordinator, PollCoordinator } from './index.js'
 
@@ -308,10 +309,20 @@ test('supports account-owned and claimed polls without storing plaintext passwor
   assert.equal(storedAuthentication.includes(sessionSecret), false)
   assert.equal(storedAccount.password, undefined)
   assert.equal(storedAccount.passwordHash.algorithm, 'pbkdf2-sha256')
+  assert.equal(storedAccount.passwordHash.iterations, 100_000)
   assert.equal(
     [...accountCoordinator.state.storage.values.keys()].some((key) => key.includes(registration.token)),
     false,
   )
+
+  const loginResponse = await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'ada@example.com', password }),
+  })
+  assert.equal(loginResponse.status, 200)
+  const login = await loginResponse.json()
+  assert.equal(login.user.email, 'ada@example.com')
+  assert.match(login.token, /^[a-f0-9]{64}\.[a-f0-9]{64}$/)
 
   const authorization = { Authorization: `Bearer ${registration.token}` }
   const created = await (await call(environment, '/api/polls', {
@@ -374,6 +385,43 @@ test('supports account-owned and claimed polls without storing plaintext passwor
     headers: authorization,
     body: JSON.stringify(pollDraft(1)),
   })).status, 401)
+})
+
+test('rejects password records above the Worker PBKDF2 limit', async () => {
+  const environment = createEnvironment()
+  const password = 'correct horse battery staple'
+  const registrationResponse = await call(environment, '/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'Ada', email: 'ada@example.com', password }),
+  })
+  assert.equal(registrationResponse.status, 201)
+  const registration = await registrationResponse.json()
+
+  const [accountKey] = registration.token.split('.')
+  const accountCoordinator = environment.ACCOUNT_COORDINATORS.coordinators.get(accountKey)
+  const storedAccount = await accountCoordinator.state.storage.get('account')
+  const iterations = 100_001
+  await accountCoordinator.state.storage.put('account', {
+    ...storedAccount,
+    passwordHash: {
+      ...storedAccount.passwordHash,
+      iterations,
+      hash: pbkdf2Sync(
+        password,
+        Buffer.from(storedAccount.passwordHash.salt, 'hex'),
+        iterations,
+        32,
+        'sha256',
+      ).toString('hex'),
+    },
+  })
+
+  const loginResponse = await call(environment, '/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'ada@example.com', password }),
+  })
+  assert.equal(loginResponse.status, 401)
+  assert.deepEqual(await loginResponse.json(), { error: 'Email or password is incorrect.' })
 })
 
 test('imports KV-era responses after an account claim is authorized', async () => {

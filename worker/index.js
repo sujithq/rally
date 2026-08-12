@@ -1,7 +1,7 @@
 const maxBodyBytes = 64 * 1024
 const defaultMaxPollResponses = 100
 const voteValues = ['yes', 'maybe', 'no']
-const passwordIterations = 310_000
+const passwordIterations = 100_000
 const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000
 const maxActiveSessions = 10
 const failedLoginWindowMs = 15 * 60 * 1000
@@ -680,6 +680,7 @@ function constantTimeEqual(left, right) {
 async function passwordMatches(password, record) {
   if (record?.algorithm !== 'pbkdf2-sha256'
     || !Number.isSafeInteger(record.iterations)
+    || record.iterations > passwordIterations
     || !/^[a-f0-9]{32}$/.test(record.salt || '')
     || !/^[a-f0-9]{64}$/.test(record.hash || '')) return false
   return constantTimeEqual(
