@@ -17,7 +17,15 @@ const htmlReplacements: Record<string, string> = {
 }
 
 export default defineConfig({
-  base: process.env.VITE_BASE_PATH || '/',
+  // This site is only ever served from its custom domain root
+  // (rally.quintelier.dev), never from the sujithq.github.io/rally/
+  // project-pages path. The Pages workflow's VITE_BASE_PATH (derived from
+  // actions/configure-pages) is intentionally ignored here: when that action
+  // doesn't observe the custom domain for a given run, it falls back to the
+  // default project-pages path and produces /rally/-prefixed asset URLs,
+  // which 404 on the custom domain. Always building with a root base path
+  // keeps asset URLs correct regardless of what configure-pages reports.
+  base: '/',
   plugins: [
     react(),
     {
